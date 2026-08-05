@@ -16,8 +16,9 @@ RUN python -m pip install \
 COPY requirements.docker.txt ./requirements.docker.txt
 RUN python -m pip install -r requirements.docker.txt
 
-COPY app_rule_bias.py hybrid_bias.py hybrid_rules.py utils.py ./
+COPY app_rule_bias.py odrl_output.py ./
 COPY model ./model
+COPY src ./src
 COPY templates ./templates
 
 # Config creates these paths during startup. The checkpoint itself is supplied
@@ -31,4 +32,3 @@ USER appuser
 EXPOSE 5001
 
 CMD ["python", "-u", "app_rule_bias.py", "--help"]
-

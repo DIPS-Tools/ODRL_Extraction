@@ -7,9 +7,9 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from hybrid_bias import decode_with_rule_bias
-from hybrid_rules import postprocess_tags
-from utils import (
+from .hybrid_bias import decode_with_rule_bias
+from .hybrid_rules import postprocess_tags
+from .utils import (
     InputFeatures,
     compute_entity_metrics_by_type,
     compute_token_metrics_by_tag,

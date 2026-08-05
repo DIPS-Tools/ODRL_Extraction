@@ -2,14 +2,13 @@
 import logging
 import os
 import argparse
-from xml.dom.minidom import Entity
 
 from model.config import Config
 import torch
-from utils import print_and_save_params, get_data
-from train import run_train
-from predict import run_test as run_plain_test
-from predict_hybrid_bias import run_test as run_hybrid_test
+from src.utils import print_and_save_params, get_data
+from src.train import run_train
+from src.predict import run_test as run_plain_test
+from src.predict_hybrid_bias import run_test as run_hybrid_test
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.ERROR)  # Only show errors, not warnings
 

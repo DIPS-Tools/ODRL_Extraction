@@ -5,9 +5,9 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
-from hybrid_rules import apply_rules_to_predictions
-from hybrid_bias import decode_with_rule_bias
-from utils import recover_label, get_ner_fmeasure
+from .hybrid_rules import apply_rules_to_predictions
+from .hybrid_bias import decode_with_rule_bias
+from .utils import recover_label, get_ner_fmeasure
 
 
 def _to_device(x, device):

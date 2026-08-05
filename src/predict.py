@@ -7,11 +7,11 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from utils import compute_entity_metrics_by_type, compute_token_metrics_by_tag
-from utils import compute_entity_metrics_by_type_bioes
-from utils import heuristic_postprocess_purpose_constraint
+from .utils import compute_entity_metrics_by_type, compute_token_metrics_by_tag
+from .utils import compute_entity_metrics_by_type_bioes
+from .utils import heuristic_postprocess_purpose_constraint
 # adjust imports to where you defined them
-from utils import recover_label, get_ner_fmeasure, InputFeatures
+from .utils import recover_label, get_ner_fmeasure, InputFeatures
 
 
 def _device_from_cfg(cfg):

@@ -12,7 +12,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from model.config import Config
-from utils import _words_from_text
+from odrl_output import format_odrl_output, split_sentences
+from src.utils import _words_from_text
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.ERROR)  # Only show errors, not warnings
@@ -28,9 +29,18 @@ class ODRLGenerationRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Policy or contract text to label.")
 
 
+class ODRLRule(BaseModel):
+    source_text: str
+    assignee: str
+    action: str
+    asset: str
+    rule_type: str
+    constraint: str
+    purpose: str
+
+
 class ODRLGenerationResponse(BaseModel):
-    text: List[str]
-    labels: List[str]
+    rules: List[ODRLRule]
 
 
 def get_input(config, sample):
@@ -261,7 +271,7 @@ def predict(request: Request, text: str = Form(...)):
 
 @app.post('/odrl_generation', response_model=ODRLGenerationResponse)
 def odrl_generation(payload: ODRLGenerationRequest):
-    """Return token-aligned ODRL BIO labels for use by other tools."""
+    """Return extracted ODRL components for use by other tools."""
     if config is None or model is None:
         raise HTTPException(
             status_code=503,
@@ -271,7 +281,14 @@ def odrl_generation(payload: ODRLGenerationRequest):
             ),
         )
 
-    return query_test(model, config, payload.text)
+    rules = []
+    for sentence in split_sentences(payload.text):
+        result = query_test(model, config, sentence)
+        rules.append({
+            "source_text": sentence,
+            **format_odrl_output(result["text"], result["labels"]),
+        })
+    return {"rules": rules}
 
 
 if __name__ == '__main__':
