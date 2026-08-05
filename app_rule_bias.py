@@ -12,10 +12,9 @@ from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from src.hybrid_bias import decode_with_rule_bias
-from src.hybrid_rules import postprocess_tags
+from src.hybrid_extraction_rules import decode_with_rule_bias, postprocess_tags
 from model.config import Config
-from odrl_output import format_odrl_output, split_sentences
+from odrl_output import format_odrl_rules, split_sentences
 from src.utils import _words_from_text
 
 logger = logging.getLogger(__name__)
@@ -339,10 +338,11 @@ def odrl_generation(payload: ODRLGenerationRequest):
     rules = []
     for sentence in split_sentences(payload.text):
         result = query_test(model, config, sentence)
-        rules.append({
-            "source_text": sentence,
-            **format_odrl_output(result["text"], result["labels"]),
-        })
+        rules.extend(format_odrl_rules(
+            sentence,
+            result["text"],
+            result["labels"],
+        ))
     return {"rules": rules}
 
 

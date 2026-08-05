@@ -5,11 +5,14 @@ import torch
 
 
 """
-Hybrid Bias — Rule‑Biased Viterbi Decode for BERT+BiLSTM+CRF
-===========================================================
+Hybrid extraction rules for BERT+BiLSTM+CRF
+============================================
 
-Adds small positive logits to emissions where rules fire, then runs CRF
-Viterbi decode. Works with your `BERT_LSTM_CRF` that exposes either:
+This module owns both stages of hybrid extraction:
+  1. add positive rule bias to emissions before CRF Viterbi decoding;
+  2. refine decoded BIO labels with deterministic post-processing.
+
+The bias stage works with `BERT_LSTM_CRF` models that expose either:
   • `compute_emissions(input_ids, attention_mask)` or
   • `forward(..., return_emissions=True)` (returns object with `.emissions`)
 
@@ -18,7 +21,7 @@ side‑effect attribute `.emissions`.
 
 Use in eval/predict (no retraining):
 
-    from hybrid_bias import decode_with_rule_bias
+    from src.hybrid_extraction_rules import decode_with_rule_bias, postprocess_tags
 
     pred_ids = decode_with_rule_bias(
         model, batch, batch_features, label2id=cfg.l2i, alpha_pos=3.0
@@ -41,7 +44,20 @@ ASSET_HEADS = {
     "metadata","log","logs","metric","metrics","identifier","identifiers","email","emails","name","names",
     "address","addresses","phone","phones","location","locations","biometric","financial","health","phi","pii",
     "account","accounts","credential","credentials","password","passwords","token","tokens","ip",
-    "cookie","cookies","device","devices","telemetry","analytics","personal","special","category", "report","reports","confidential","report"
+    "cookie","cookies","device","devices","telemetry","analytics","report","reports",
+    "recording","recordings","output","outputs","material","materials","database","databases",
+    "code","software","image","images","video","videos"
+}
+ASSET_MODIFIERS = {
+    "audio", "video", "digital", "personal", "special", "category", "confidential",
+    "customer", "user", "model", "training", "source", "derived", "licensed",
+    "original", "research", "health", "financial", "shared", "biometric",
+}
+ASSET_DETERMINERS = {"the", "a", "an", "this", "that", "these", "those", "any", "all"}
+DATA_PARTY_HEADS = {
+    "controller", "controllers", "discloser", "disclosers", "exporter", "exporters",
+    "importer", "importers", "owner", "owners", "processor", "processors",
+    "provider", "providers", "receiver", "receivers", "recipient", "recipients",
 }
 DUTY_VERBS = {
     "ensure","implement","maintain","provide","notify","report","cooperate","obtain","document",
@@ -155,6 +171,96 @@ def _strip_special(toks: Sequence[str]) -> List[str]:
     return [t for t in toks if t not in ("[CLS]","[SEP]")]
 
 
+PURPOSE_PREFIXES = (
+    ("in", "order", "to"),
+    ("for", "the", "purpose", "of"),
+    ("for", "purposes", "of"),
+    ("with", "the", "aim", "of"),
+    ("with", "the", "objective", "of"),
+    ("so", "that"),
+    ("to", "enable"),
+    ("to", "facilitate"),
+    ("to", "improve"),
+    ("to", "support"),
+    ("to", "ensure"),
+    ("to", "comply"),
+    ("to", "fulfil"),
+    ("to", "fulfill"),
+    ("to", "protect"),
+    ("to", "prevent"),
+    ("for", "research"),
+    ("for", "academic", "research"),
+    ("for", "scientific", "research"),
+    ("for", "commercial", "use"),
+    ("for", "non-commercial", "use"),
+    ("for", "internal", "use"),
+    ("for", "marketing"),
+    ("for", "analytics"),
+    ("for", "training"),
+    ("for", "evaluation"),
+    ("for", "security"),
+    ("for", "compliance"),
+)
+PURPOSE_SINGLE_TOKENS = {"commercially"}
+CLAUSE_PUNCTUATION = {",", ";", ".", "!", "?"}
+
+
+def _purpose_spans(tokens: Sequence[str], limit: int = 40) -> List[tuple[int, int]]:
+    """Return high-confidence, non-overlapping purpose spans."""
+    low = [token.lower() for token in tokens]
+    candidates: List[tuple[int, int]] = []
+
+    for start, token in enumerate(low):
+        if token in PURPOSE_SINGLE_TOKENS:
+            candidates.append((start, start + 1))
+
+        for prefix in PURPOSE_PREFIXES:
+            width = len(prefix)
+            if tuple(low[start:start + width]) != prefix:
+                continue
+
+            end = start + width
+            while end < min(len(tokens), start + limit):
+                if tokens[end] in CLAUSE_PUNCTUATION:
+                    break
+                end += 1
+            candidates.append((start, end))
+
+    # Prefer the longest match at a shared start and avoid duplicate overlaps.
+    selected: List[tuple[int, int]] = []
+    for span in sorted(set(candidates), key=lambda item: (item[0], -(item[1] - item[0]))):
+        if not any(span[0] < end and span[1] > start for start, end in selected):
+            selected.append(span)
+    return selected
+
+
+def _asset_spans(tokens: Sequence[str]) -> List[tuple[int, int]]:
+    """Find conservative noun phrases ending in a known asset head."""
+    low = [token.lower() for token in tokens]
+    candidates: List[tuple[int, int]] = []
+
+    for head, token in enumerate(low):
+        if token not in ASSET_HEADS:
+            continue
+        if token == "data" and head + 1 < len(low) and low[head + 1] in DATA_PARTY_HEADS:
+            continue
+
+        start = head
+        while start > 0 and low[start - 1] in ASSET_MODIFIERS:
+            start -= 1
+        if start > 0 and low[start - 1] in ASSET_DETERMINERS:
+            start -= 1
+        candidates.append((start, head + 1))
+
+    # Prefer complete compounds such as "The audio recording" over the
+    # overlapping one-token "audio" candidate.
+    selected: List[tuple[int, int]] = []
+    for span in sorted(set(candidates), key=lambda item: (-(item[1] - item[0]), item[0])):
+        if not any(span[0] < end and span[1] > start for start, end in selected):
+            selected.append(span)
+    return sorted(selected)
+
+
 # ---------------------------------------------------------------------------
 # Rule bias builder
 # ---------------------------------------------------------------------------
@@ -166,7 +272,8 @@ def build_rule_bias_for_tokens(
     num_classes: int | None = None,
 ) -> torch.Tensor:
     """Return bias tensor [T_no_special, C] with +alpha on suggested tags.
-    PURPOSE cues are folded into CONSTRAINT (no PURPOSE tag in BIO_HEAD).
+    PURPOSE cues use PURPOSE labels when the checkpoint supports them and fall
+    back to CONSTRAINT only for older schemas.
     If num_classes is provided, indices beyond it are skipped safely.
     """
     toks = _strip_special(tokens)
@@ -182,28 +289,36 @@ def build_rule_bias_for_tokens(
         if i >= C:    return None
         return i
 
-    def add_span(start: int, end: int, btag: str, itag: str):
+    def add_span(start: int, end: int, btag: str, itag: str, scale: float = 1.0):
         if start < 0 or start >= T: return
         bi = _idx(btag); ii = _idx(itag)
         if bi is None or ii is None: return
-        bias[start, bi] += alpha_pos
+        bias[start, bi] += alpha_pos * scale
         for k in range(start+1, min(end, T)):
-            bias[k, ii] += alpha_pos
+            bias[k, ii] += alpha_pos * scale
 
     # RULE_TYPE cues ---------------------------------------------------------
-    for m in re.finditer(r"\b(shall not|must not|may not|prohibited from)\b", txt):
+    for m in re.finditer(r"\b(shall not|must not|may not|cannot|prohibited from)\b", txt):
         s = txt[:m.start()].count(" ")
         l = len(m.group(1).split())
-        add_span(s, s+l, "B-RULE_TYPE", "I-RULE_TYPE")
-    for m in re.finditer(r"\b(may|can|permitted to|authorized to|shall|must|is required to|will ensure)\b", txt):
+        add_span(s, s+l, "B-RULE_TYPE-PROHIBITION", "I-RULE_TYPE-PROHIBITION")
+    for m in re.finditer(r"\b(may(?!\s+not)|can(?!\s+not)|permitted to|authorized to)\b", txt):
         s = txt[:m.start()].count(" ")
         l = len(m.group(1).split())
-        add_span(s, s+l, "B-RULE_TYPE", "I-RULE_TYPE")
+        add_span(s, s+l, "B-RULE_TYPE-PERMISSION", "I-RULE_TYPE-PERMISSION")
+    for m in re.finditer(r"\b(shall(?!\s+not)|must(?!\s+not)|is required to|will ensure)\b", txt):
+        s = txt[:m.start()].count(" ")
+        l = len(m.group(1).split())
+        add_span(s, s+l, "B-RULE_TYPE-OBLIGATION", "I-RULE_TYPE-OBLIGATION")
 
-    # PURPOSE -> CONSTRAINT --------------------------------------------------
-    for m in re.finditer(r"\bin order to\b", txt):
-        s = txt[:m.start()].count(" ")
-        add_span(s, s+3, "B-CONSTRAINT", "I-CONSTRAINT")
+    # PURPOSE cues -----------------------------------------------------------
+    purpose_tags = (
+        ("B-PURPOSE", "I-PURPOSE")
+        if "B-PURPOSE" in label2id and "I-PURPOSE" in label2id
+        else ("B-CONSTRAINT", "I-CONSTRAINT")
+    )
+    for start, end in _purpose_spans(toks):
+        add_span(start, end, *purpose_tags)
 
     # Temporal constraints ---------------------------------------------------
     for m in re.finditer(r"\b(within|no\s+later\s+than|at\s+least|for|up\s+to|prior\s+to|after|before)\b\s+\d{1,4}\s+(day|days|week|weeks|month|months|year|years|hour|hours)\b", txt):
@@ -324,12 +439,9 @@ def build_rule_bias_for_tokens(
         if w in SINGLE_ASSIGNER:
             add_span(i, i+1, "B-PARTY_ASSIGNER", "I-PARTY_ASSIGNER")
 
-    # Light ASSET head prior -------------------------------------------------
-    for i, w in enumerate(low):
-        if w in {"data","information","records","dataset","datasets","report","reports"}:
-            bi = _idx("B-ASSET")
-            if bi is not None:
-                bias[i, bi] += alpha_pos * 0.8
+    # Conservative ASSET phrase prior ---------------------------------------
+    for start, end in _asset_spans(toks):
+        add_span(start, end, "B-ASSET", "I-ASSET", scale=0.8)
 
     return bias
 
@@ -475,6 +587,192 @@ def decode_with_rule_bias(
         clean_pred_ids.append(clean_seq)
 
     return clean_pred_ids
+
+
+# ---------------------------------------------------------------------------
+# Deterministic post-processing after CRF decoding
+# ---------------------------------------------------------------------------
+
+def _tag_range(
+    tags: List[str],
+    start: int,
+    end: int,
+    btag: str,
+    itag: str,
+) -> None:
+    """Apply a BIO label to the half-open token range ``[start, end)``."""
+    if start < 0 or start >= len(tags) or end <= start:
+        return
+    tags[start] = btag
+    for index in range(start + 1, min(end, len(tags))):
+        tags[index] = itag
+
+
+def _clause_end(tokens: Sequence[str], start: int, limit: int = 40) -> int:
+    end = start + 1
+    while end < min(len(tokens), start + limit) and tokens[end] not in CLAUSE_PUNCTUATION:
+        end += 1
+    return end
+
+
+def _mark_phrase_clauses(
+    tokens: Sequence[str],
+    tags: List[str],
+    phrases: Sequence[Sequence[str]],
+    btag: str,
+    itag: str,
+) -> None:
+    low = [token.lower() for token in tokens]
+    for phrase in phrases:
+        width = len(phrase)
+        for start in range(0, max(0, len(low) - width + 1)):
+            if tuple(low[start:start + width]) == tuple(phrase):
+                _tag_range(tags, start, _clause_end(tokens, start), btag, itag)
+
+
+def postprocess_tags(
+    tokens: Sequence[str],
+    tags: Sequence[str],
+    *,
+    purpose_as_constraint: bool = False,
+) -> List[str]:
+    """Refine decoded labels using high-confidence legal-language cues.
+
+    The returned labels remain aligned one-to-one with ``tags``. Purpose cues
+    are emitted as PURPOSE for the current schema; callers supporting an older
+    schema can request the historical CONSTRAINT fallback.
+    """
+    out = list(tags)
+    tokens_view = list(tokens[:len(out)])
+    low = [token.lower() for token in tokens_view]
+    txt = " ".join(low)
+
+    # Canonical rule types used by the trained Contract-BERT checkpoint.
+    rule_patterns = (
+        (
+            r"\b(may(?!\s+not)|can(?!\s+not)|permitted to|authorized to)\b",
+            "B-RULE_TYPE-PERMISSION",
+            "I-RULE_TYPE-PERMISSION",
+        ),
+        (
+            r"\b(shall(?!\s+not)|must(?!\s+not)|is required to|will ensure)\b",
+            "B-RULE_TYPE-OBLIGATION",
+            "I-RULE_TYPE-OBLIGATION",
+        ),
+        # Apply multi-token prohibitions last so they take precedence over a
+        # modal's weaker standalone permission/obligation interpretation.
+        (
+            r"\b(shall not|must not|may not|cannot|prohibited from)\b",
+            "B-RULE_TYPE-PROHIBITION",
+            "I-RULE_TYPE-PROHIBITION",
+        ),
+    )
+    for pattern, btag, itag in rule_patterns:
+        for match in re.finditer(pattern, txt):
+            start = txt[:match.start()].count(" ")
+            end = start + len(match.group(1).split())
+            _tag_range(out, start, end, btag, itag)
+
+    # Recover high-confidence asset phrases when the model missed them. Do not
+    # replace tokens already assigned to a different component.
+    for start, end in _asset_spans(tokens_view):
+        if all(out[index] == "O" or out[index].endswith("ASSET") for index in range(start, end)):
+            _tag_range(out, start, end, "B-ASSET", "I-ASSET")
+
+    # Expand a model-predicted asset left across an adjacent title-cased name.
+    for index in range(min(len(tokens_view), len(out))):
+        if not out[index].endswith("ASSET") or low[index] not in ASSET_HEADS:
+            continue
+        left = index
+        while (
+            left > 0
+            and tokens_view[left - 1][:1].isupper()
+            and out[left - 1] in {"O", "I-ASSET"}
+        ):
+            left -= 1
+        if left < index:
+            _tag_range(out, left, index + 1, "B-ASSET", "I-ASSET")
+
+    # Temporal constraints.
+    temporal_pattern = re.compile(
+        r"\b(within|no\s+later\s+than|at\s+least|for|up\s+to|prior\s+to|after|before)\b"
+        r"\s+\d{1,4}\s+(day|days|week|weeks|month|months|year|years|hour|hours)\b"
+    )
+    for match in temporal_pattern.finditer(txt):
+        start = txt[:match.start()].count(" ")
+        _tag_range(
+            out,
+            start,
+            start + len(match.group(0).split()),
+            "B-CONSTRAINT",
+            "I-CONSTRAINT",
+        )
+
+    # Conditional, restrictive, date-range, and jurisdiction constraints.
+    constraint_phrases = (
+        ("subject", "to"),
+        ("provided", "that"),
+        ("on", "condition", "that"),
+        ("so", "long", "as"),
+    )
+    _mark_phrase_clauses(
+        tokens_view,
+        out,
+        constraint_phrases,
+        "B-CONSTRAINT",
+        "I-CONSTRAINT",
+    )
+    for index, token in enumerate(low):
+        if token == "between" and "and" in low[index + 1:min(len(low), index + 12)]:
+            _tag_range(out, index, _clause_end(tokens_view, index, 14), "B-CONSTRAINT", "I-CONSTRAINT")
+        elif token == "until":
+            _tag_range(out, index, _clause_end(tokens_view, index, 10), "B-CONSTRAINT", "I-CONSTRAINT")
+        elif token == "only" and index + 1 < len(low) and low[index + 1] in {
+            "to", "with", "for", "by", "if", "when", "where", "after", "before"
+        }:
+            _tag_range(out, index, _clause_end(tokens_view, index), "B-CONSTRAINT", "I-CONSTRAINT")
+        elif token in {"outside", "within", "in"}:
+            end = index + 1
+            found_jurisdiction = False
+            while end < min(len(tokens_view), index + 8):
+                if tokens_view[end] in JURISDICTIONS:
+                    found_jurisdiction = True
+                if tokens_view[end] in CLAUSE_PUNCTUATION:
+                    break
+                end += 1
+            if found_jurisdiction:
+                _tag_range(out, index, end, "B-CONSTRAINT", "I-CONSTRAINT")
+
+    # Purpose is applied last so explicit purpose cues correct PURPOSE spans
+    # that the model confused with CONSTRAINT or other nested components.
+    purpose_tags = (
+        ("B-CONSTRAINT", "I-CONSTRAINT")
+        if purpose_as_constraint
+        else ("B-PURPOSE", "I-PURPOSE")
+    )
+    for start, end in _purpose_spans(tokens_view):
+        _tag_range(out, start, end, *purpose_tags)
+
+    return out
+
+
+def apply_rules_to_predictions(
+    pred_bio: List[List[str]],
+    features: List[object],
+) -> List[List[str]]:
+    """Apply deterministic post-processing to a prediction batch."""
+    fixed: List[List[str]] = []
+    for index, tags in enumerate(pred_bio):
+        if index >= len(features):
+            fixed.append(list(tags))
+            continue
+
+        feature = features[index]
+        tokens = feature.text if isinstance(feature.text, list) else str(feature.text).split()
+        tokens = _strip_special(tokens)[:len(tags)]
+        fixed.append(postprocess_tags(tokens, tags))
+    return fixed
+
 
 # ---------------------------------------------------------------------------
 # Tiny self‑check

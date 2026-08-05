@@ -3,7 +3,7 @@ import os
 from typing import Optional, List
 
 import pandas as pd
-# from hybrid_rules import apply_rules_to_predictions
+# from .hybrid_extraction_rules import apply_rules_to_predictions
 import torch
 from tqdm import tqdm
 
