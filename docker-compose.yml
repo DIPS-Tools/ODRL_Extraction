@@ -1,0 +1,79 @@
+services:
+  odrl-rule-bias:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: odrl-rule-bias:local
+    container_name: odrl-rule-bias
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${ODRL_PORT:-5001}:5001"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_OFFLINE: "1"
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-4}"
+      MKL_NUM_THREADS: "${MKL_NUM_THREADS:-4}"
+    volumes:
+      - type: bind
+        source: ${WORD_EMBEDDING_MODEL_PATH:-/home/mh1f25/scratch/llms_model/bert-base-uncased-contracts}
+        target: /models/bert-base-uncased-contracts
+        read_only: true
+      - type: bind
+        source: ./save_model/contract-bert-lstm-crf_ep20_bz16_max_len400_lr5e-05_ltBIO_num_layers1_best_f1.pth
+        target: /app/save_model/contract-bert-lstm-crf_ep20_bz16_max_len400_lr5e-05_ltBIO_num_layers1_best_f1.pth
+        read_only: true
+      - type: bind
+        source: ./data
+        target: /app/data
+        read_only: true
+    command:
+      - python
+      - -u
+      - app_rule_bias.py
+      - --model
+      - contract-bert-lstm-crf
+      - --data_path
+      - ./data/
+      - --save_dir
+      - ./save_model
+      - --word_embedding_model_path
+      - /models/bert-base-uncased-contracts
+      - --num_epochs
+      - "20"
+      - --batch_size
+      - "16"
+      - --max_length
+      - "400"
+      - --learning_rate
+      - "5e-5"
+      - --label_type
+      - BIO
+      - --rnn_layers
+      - "1"
+      - --rule_bias_alpha
+      - "3.0"
+      - --device
+      - cpu
+      - --do_test
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/docs', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
