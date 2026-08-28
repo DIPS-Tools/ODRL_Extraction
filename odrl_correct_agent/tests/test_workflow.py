@@ -24,6 +24,9 @@ from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_correct impor
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_output import (
     build_diff_record,
 )
+from odrl_correct_agent.odrl_correct_process.agent.sharded_batch import (
+    run_sharded_batch_job,
+)
 from odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph import (
     DEMO_AI_RESPONSE,
     DEMO_INPUT,
@@ -303,6 +306,43 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(delays, [2])
             self.assertEqual(finalized["watch"]["consecutive_errors"], 0)
 
+    async def test_sharded_batch_runs_sequentially_and_merges_all_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_three_splits(root)
+            fake_client = _FakeOpenAIClient()
+            parent_path = await prepare_batch_job(
+                [root / "train.txt", root / "valid.txt", root / "test.txt"],
+                output_dir=root,
+                model_name="test-model",
+                call_endpoint=False,
+                submit=False,
+            )
+            finalized = await run_sharded_batch_job(
+                parent_path,
+                maximum_prompt_tokens=2000,
+                poll_interval_seconds=1,
+                client=fake_client,
+            )
+            self.assertEqual(finalized["status"], "finalized")
+            self.assertEqual(finalized["shard_count"], 3)
+            self.assertEqual(finalized["completed_shards"], 3)
+            for key in (
+                "ner_outputs",
+                "odrl_outputs",
+                "diff_outputs",
+                "odrl_diff_outputs",
+            ):
+                self.assertEqual(len(finalized[key]), 3)
+                self.assertTrue(all(Path(path).is_file() for path in finalized[key]))
+            for path in finalized["ner_outputs"]:
+                records = [
+                    json.loads(line)
+                    for line in Path(path).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len(records), 1)
+
     async def test_batch_watcher_stops_on_expired_remote_job(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -449,12 +489,23 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             "Data Processor",
         )
 
-    async def test_original_entities_are_retained_when_ai_and_endpoint_fail(self) -> None:
+    async def test_empty_ai_rules_remove_noisy_original_entities(self) -> None:
         state = await build_workflow().ainvoke(
             DEMO_INPUT,
             model_name="test-model",
             call_endpoint=False,
             ai_response_override={"validated_policy_rules": []},
+        )
+        self.assertEqual(state["corrected_record"]["entities"], [])
+        self.assertEqual(state["text_odrl_record"]["odrl"], [])
+        self.assertEqual(state["selected_from"], "ai_reconciliation")
+
+    async def test_original_entities_are_retained_when_ai_response_is_invalid(self) -> None:
+        state = await build_workflow().ainvoke(
+            DEMO_INPUT,
+            model_name="test-model",
+            call_endpoint=False,
+            ai_response_override="not-json",
         )
         self.assertEqual(state["corrected_record"], DEMO_INPUT)
         self.assertEqual(state["selected_from"], "original_ner_fallback")

@@ -34,6 +34,9 @@ from odrl_correct_agent.odrl_correct_process.agent.batch_processing import (
     submit_batch_job,
     watch_and_finalize_batch_job,
 )
+from odrl_correct_agent.odrl_correct_process.agent.sharded_batch import (
+    run_sharded_batch_job,
+)
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_initialize import node_initialize
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_correct import node_odrl_correct
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_extraction import node_odrl_extraction
@@ -538,6 +541,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--batch-shard-run",
+        metavar="MANIFEST",
+        help=(
+            "Split an already prepared manifest into prompt-token-bounded "
+            "shards, run them sequentially, and merge all final outputs."
+        ),
+    )
+    parser.add_argument(
+        "--batch-shard-max-prompt-tokens",
+        type=int,
+        default=int(os.getenv("ODRL_BATCH_SHARD_MAX_PROMPT_TOKENS", "1500000")),
+        help="Conservative estimated prompt-token ceiling per shard (default: 1500000).",
+    )
+    parser.add_argument(
         "--batch-poll-seconds",
         type=float,
         default=float(os.getenv("ODRL_BATCH_POLL_SECONDS", "300")),
@@ -585,6 +602,7 @@ async def _async_main(args: argparse.Namespace) -> int:
         bool(args.batch_status),
         bool(args.batch_finalize),
         bool(args.batch_watch_finalize),
+        bool(args.batch_shard_run),
     ]
     if sum(bool(action) for action in batch_actions) > 1:
         raise ValueError("Select only one Batch action at a time.")
@@ -592,6 +610,29 @@ async def _async_main(args: argparse.Namespace) -> int:
         raise ValueError("Use either --dataset or --all-splits, not both.")
     if args.limit is not None and args.limit <= 0:
         raise ValueError("--limit must be greater than zero.")
+    if args.batch_shard_max_prompt_tokens <= 0:
+        raise ValueError("--batch-shard-max-prompt-tokens must be greater than zero.")
+    if args.batch_shard_run:
+        manifest = await run_sharded_batch_job(
+            args.batch_shard_run,
+            maximum_prompt_tokens=args.batch_shard_max_prompt_tokens,
+            poll_interval_seconds=args.batch_poll_seconds,
+            timeout_hours=args.batch_watch_timeout_hours,
+            max_consecutive_errors=args.batch_max_consecutive_errors,
+            strict=not args.allow_batch_fallbacks,
+        )
+        print(f"Finalized {manifest.get('request_count') or 0} sharded Batch record(s).")
+        print(f"Shards: {manifest.get('shard_count') or 0}")
+        for key, label in (
+            ("ner_outputs", "NER dataset"),
+            ("odrl_outputs", "Text-to-ODRL dataset"),
+            ("diff_outputs", "Correction diff dataset"),
+            ("odrl_diff_outputs", "ODRL correction diff dataset"),
+        ):
+            for output_path in manifest.get(key) or []:
+                print(f"{label}: {output_path}")
+        print(f"Manifest: {Path(args.batch_shard_run).expanduser().resolve()}")
+        return 0
     if args.batch_submit:
         manifest = submit_batch_job(args.batch_submit)
         print(f"Batch submitted: {manifest['batch_id']}")

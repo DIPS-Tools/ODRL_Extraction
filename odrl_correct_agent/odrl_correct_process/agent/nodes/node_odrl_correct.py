@@ -426,8 +426,6 @@ async def node_odrl_correct(state: ODRLCorrectionState) -> dict[str, Any]:
         )
         rules = normalize_rules(ai_result["validated_policy_rules"], source_text)
         selected_from = "ai_reconciliation"
-        if not rules:
-            raise ValueError("AI reconciliation returned no grounded policy rules.")
     except Exception as exc:
         warnings.append(f"AI reconciliation fallback: {type(exc).__name__}: {exc}")
         rules = endpoint_rules or _original_entities_to_rules(source_text, original_entities)
@@ -450,9 +448,14 @@ async def node_odrl_correct(state: ODRLCorrectionState) -> dict[str, Any]:
         )
     warnings.extend(grounding_warnings)
 
-    # If neither AI nor endpoint produced a groundable entity, retain the
-    # validated original record instead of emitting an empty training sample.
-    if not corrected_entities and original_entities:
+    # A valid AI response may intentionally contain no rules: removing noisy
+    # original labels is a legitimate dataset correction. Only fallback paths
+    # retain the original record when their evidence cannot be grounded.
+    if (
+        selected_from != "ai_reconciliation"
+        and not corrected_entities
+        and original_entities
+    ):
         corrected_entities = list(original_entities)
         selected_from = "original_ner_fallback"
         for rule in rules:

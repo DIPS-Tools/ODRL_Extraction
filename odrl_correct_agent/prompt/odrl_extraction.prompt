@@ -7,6 +7,9 @@ Each RULE must have exactly these eight string keys, in any order:
 {"source_text":"","assignee":"","action":"","asset":"","attributed_party":"","rule_type":"","constraint":"","purpose":""}
 Use an empty string, never null, for an absent field. Do not add any other
 keys, IDs, confidence values, or metadata.
+If SOURCE contains no actual deontic permission, obligation, or prohibition,
+return {"validated_policy_rules":[]}. Descriptive statements, definitions,
+headings, and purposes without a rule marker are not policy rules.
 
 Requirements:
 - Every non-empty text field must be one exact contiguous quote from SOURCE.
