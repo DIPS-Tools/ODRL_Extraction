@@ -1,0 +1,39 @@
+Correct an ODRL NER record using SOURCE, ORIGINAL NER, and MODEL RULES.
+SOURCE is authoritative; the other inputs may be incomplete or wrong.
+
+Return JSON only: {"validated_policy_rules":[RULE,...]}.
+Each RULE has exactly these keys:
+{"source_text":"","assignee":"","action":"","asset":"","attributed_party":"","rule_type":"","constraint":"","purpose":""}
+
+Requirements:
+- Every non-empty text field must be one exact contiguous quote from SOURCE.
+  Do not paraphrase, normalize, change case, or invent text.
+- Create one atomic rule per rule-marker/action pair. Thus "may play but may
+  not broadcast" is two rules; one marker governing coordinated actions is one
+  rule when its action quote is contiguous.
+- source_text is the smallest exact quote that locates the complete atomic rule.
+- action excludes the modal/rule marker (may, shall, must, may not, cannot,
+  required to, etc.).
+- rule_type is only permission, obligation, or prohibition:
+  may/can/permitted/authorized -> permission;
+  shall/must/should/required -> obligation;
+  may not/must not/shall not/cannot/prohibited -> prohibition.
+- assignee is the actor/receiver of the rule. asset is the object/resource acted
+  upon; follow the dataset convention when an action object such as "Data
+  Processor" is annotated as ASSET. attributed_party is another relevant party.
+- constraint states when/where/how/under what condition. purpose states why.
+- Use "" when a component is absent. Avoid punctuation and unrelated context.
+- Shared assignee/asset may be reused across coordinated rules only when the
+  same exact source quote clearly applies.
+- Preserve source order. IDs and provenance are added by code; do not output them.
+
+ORIGINAL NER items use {"s":start,"e":end,"l":label,"v":source_value}.
+
+SOURCE:
+{{SOURCE_TEXT}}
+
+ORIGINAL NER:
+{{ORIGINAL_ENTITIES}}
+
+MODEL RULES:
+{{MODEL_RULES}}
