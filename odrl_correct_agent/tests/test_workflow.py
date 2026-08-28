@@ -60,6 +60,9 @@ class _FakeFiles:
         ]
         return SimpleNamespace(id="file-input", purpose=purpose)
 
+    def retrieve(self, file_id: str):
+        return SimpleNamespace(id=file_id, purpose="batch", status="processed")
+
     def content(self, file_id: str):
         if file_id == "file-errors":
             return _FakeFileContent(b"")

@@ -184,7 +184,14 @@ def _create_client() -> OpenAI:
     base_url = str(
         os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or ""
     ).strip()
-    return OpenAI(api_key=api_key, base_url=base_url or None)
+    organization = str(os.getenv("OPENAI_ORG_ID") or "").strip()
+    project = str(os.getenv("OPENAI_PROJECT_ID") or "").strip()
+    return OpenAI(
+        api_key=api_key,
+        organization=organization or None,
+        project=project or None,
+        base_url=base_url or None,
+    )
 
 
 def _get_value(value: Any, name: str, default: Any = None) -> Any:
@@ -239,6 +246,75 @@ def _batch_error_summaries(batch_errors: Any) -> list[str]:
         if parts:
             summaries.append("; ".join(parts))
     return summaries
+
+
+def _wait_for_batch_file_ready(
+    api: Any,
+    file_id: str,
+    *,
+    timeout_seconds: float | None = None,
+    poll_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Verify the uploaded file is visible and processed before Batch creation."""
+    retrieve = getattr(getattr(api, "files", None), "retrieve", None)
+    # Lightweight test doubles and compatible providers may omit retrieval.
+    if not callable(retrieve):
+        return {"id": file_id, "status": "verification_unavailable"}
+
+    timeout = float(
+        timeout_seconds
+        if timeout_seconds is not None
+        else os.getenv("ODRL_BATCH_FILE_READY_TIMEOUT_SECONDS", "180")
+    )
+    interval = float(
+        poll_seconds
+        if poll_seconds is not None
+        else os.getenv("ODRL_BATCH_FILE_READY_POLL_SECONDS", "2")
+    )
+    deadline = time.monotonic() + max(timeout, 0.0)
+    last_error = ""
+    while True:
+        try:
+            remote_file = retrieve(file_id)
+            status = str(_get_value(remote_file, "status", "") or "").lower()
+            purpose = str(_get_value(remote_file, "purpose", "") or "").lower()
+            if purpose and purpose != "batch":
+                raise RuntimeError(
+                    f"Uploaded file {file_id} has purpose {purpose!r}, not 'batch'."
+                )
+            if status in {"processed", "ready"}:
+                logger.info(
+                    "batch_submit status=file_ready file_id=%s file_status=%s",
+                    file_id,
+                    status,
+                )
+                details = _json_safe(remote_file)
+                return details if isinstance(details, dict) else {
+                    "id": file_id,
+                    "status": status,
+                }
+            if status in {"error", "failed", "cancelled", "deleted"}:
+                raise RuntimeError(
+                    f"Uploaded Batch file {file_id} entered terminal status {status!r}."
+                )
+            last_error = f"file status is {status or 'unknown'}"
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Uploaded Batch file {file_id} was not ready after {timeout:.0f}s: "
+                f"{last_error}. The Batch was not submitted. Check that the API "
+                "key, OPENAI_ORG_ID, and OPENAI_PROJECT_ID use the same project."
+            )
+        logger.info(
+            "batch_submit status=waiting_for_file file_id=%s detail=%s",
+            file_id,
+            last_error,
+        )
+        time.sleep(max(interval, 0.1))
 
 
 async def _run_preparation_nodes(state: ODRLCorrectionState) -> None:
@@ -477,6 +553,14 @@ def submit_batch_job(manifest_path: str | Path, *, client: Any = None) -> dict[s
             "batch_submit status=reusing_upload input_file_id=%s",
             manifest["input_file_id"],
         )
+
+    file_details = _wait_for_batch_file_ready(
+        api,
+        str(manifest["input_file_id"]),
+    )
+    manifest["input_file_status"] = str(file_details.get("status") or "unknown")
+    manifest["input_file_verified_at"] = datetime.now(timezone.utc).isoformat()
+    _write_json_atomic(path, manifest)
 
     batch = api.batches.create(
         input_file_id=manifest["input_file_id"],
