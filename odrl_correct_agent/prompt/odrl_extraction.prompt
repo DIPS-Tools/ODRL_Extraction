@@ -1,9 +1,12 @@
 Correct an ODRL NER record using SOURCE, ORIGINAL NER, and MODEL RULES.
 SOURCE is authoritative; the other inputs may be incomplete or wrong.
 
-Return JSON only: {"validated_policy_rules":[RULE,...]}.
-Each RULE has exactly these keys:
+Return exactly one JSON object and nothing else (no Markdown, comments, or
+explanation): {"validated_policy_rules":[RULE,...]}.
+Each RULE must have exactly these eight string keys, in any order:
 {"source_text":"","assignee":"","action":"","asset":"","attributed_party":"","rule_type":"","constraint":"","purpose":""}
+Use an empty string, never null, for an absent field. Do not add any other
+keys, IDs, confidence values, or metadata.
 
 Requirements:
 - Every non-empty text field must be one exact contiguous quote from SOURCE.
@@ -26,6 +29,24 @@ Requirements:
 - Shared assignee/asset may be reused across coordinated rules only when the
   same exact source quote clearly applies.
 - Preserve source order. IDs and provenance are added by code; do not output them.
+- Before answering, silently check that every non-empty field is an exact
+  contiguous substring of SOURCE (action may omit only its modal marker), that
+  rule_type is one of the three allowed values, and that the JSON is valid.
+- If evidence conflicts, prefer SOURCE and ORIGINAL NER boundaries; use MODEL
+  RULES only as a hypothesis. Never copy a malformed or hallucinated value from
+  MODEL RULES.
+
+Worked example (follow this format, but use the supplied SOURCE for the real
+answer):
+SOURCE: "The audio recording may be played at a private event but may not be broadcast publicly."
+Return:
+{"validated_policy_rules":[
+  {"source_text":"The audio recording may be played at a private event","assignee":"","action":"played","asset":"The audio recording","attributed_party":"","rule_type":"permission","constraint":"at a private event","purpose":""},
+  {"source_text":"may not be broadcast publicly.","assignee":"","action":"broadcast","asset":"The audio recording","attributed_party":"","rule_type":"prohibition","constraint":"publicly","purpose":""}
+]}
+The example demonstrates two important rules: split coordinated permission and
+prohibition clauses, and keep every quoted value grounded in SOURCE. In the
+actual answer, do not include the explanatory text or code fence.
 
 ORIGINAL NER items use {"s":start,"e":end,"l":label,"v":source_value}.
 

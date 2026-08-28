@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from odrl_correct_agent.query_process.agent.state import ODRLCorrectionState
+from odrl_correct_agent.odrl_correct_process.agent.state import ODRLCorrectionState
 from odrl_correct_agent.tools.odrl_extraction_tool import aextract_odrl_components
 
 

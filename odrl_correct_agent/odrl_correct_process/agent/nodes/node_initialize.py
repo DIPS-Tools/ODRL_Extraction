@@ -8,7 +8,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from odrl_correct_agent.query_process.agent.state import ODRLCorrectionState
+from odrl_correct_agent.odrl_correct_process.agent.state import ODRLCorrectionState
 
 
 def _load_environment() -> None:

@@ -1,10 +1,19 @@
 """Convert token-aligned ODRL labels into the public API response shape."""
 
 import re
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 
 OUTPUT_FIELDS = ("assignee", "action", "asset", "rule_type", "constraint", "purpose")
+ODRL_FIELDS = (
+    "source_text",
+    "assignee",
+    "action",
+    "asset",
+    "rule_type",
+    "constraint",
+    "purpose",
+)
 ENTITY_FIELDS = {
     "ASSIGNEE": "assignee",
     "ACTION": "action",
@@ -205,3 +214,212 @@ def format_odrl_rules(
             rule["asset"] = shared_asset
 
     return rules
+
+
+def _compact(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _word_pretok_with_offsets(text: str) -> tuple[list[str], list[tuple[int, int]]]:
+    """Split text into word-like tokens while tracking character offsets."""
+    words: list[str] = []
+    spans: list[tuple[int, int]] = []
+    start = None
+
+    for index, char in enumerate(text):
+        if char.isspace():
+            if start is not None:
+                words.append(text[start:index])
+                spans.append((start, index))
+                start = None
+            continue
+        if start is None:
+            start = index
+
+    if start is not None:
+        words.append(text[start:len(text)])
+        spans.append((start, len(text)))
+
+    if not words and text:
+        words = [text]
+        spans = [(0, len(text))]
+
+    return words, spans
+
+
+def _build_char_mask(text: str, entities: list[dict[str, Any]]) -> list[str]:
+    """Build a character-level label mask with deterministic overlap handling."""
+    char_mask = ["O"] * len(text)
+    priority = {
+        "RULE_TYPE-PERMISSION": 0,
+        "RULE_TYPE-OBLIGATION": 1,
+        "RULE_TYPE-PROHIBITION": 2,
+        "ASSIGNEE": 3,
+        "ACTION": 4,
+        "ASSET": 5,
+        "CONSTRAINT": 6,
+        "PURPOSE": 7,
+    }
+    ordered_entities = sorted(
+        entities,
+        key=lambda entity: priority.get(str(entity["label"]), 999),
+    )
+    for entity in ordered_entities:
+        start = max(0, min(int(entity["start"]), len(text)))
+        end = max(0, min(int(entity["end"]), len(text)))
+        label = str(entity["label"])
+        for index in range(start, end):
+            char_mask[index] = label
+    return char_mask
+
+
+def _spans_to_bio_over_words(
+    text: str,
+    entities: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """Convert span entities to BIO tags over the tokenization used here."""
+    words, word_spans = _word_pretok_with_offsets(text)
+    char_mask = _build_char_mask(text, entities)
+
+    labels: list[str] = []
+    previous_label = "O"
+    for start, end in word_spans:
+        label = "O"
+        for index in range(start, end):
+            if 0 <= index < len(char_mask) and char_mask[index] != "O":
+                label = char_mask[index]
+                break
+        if label == "O":
+            labels.append("O")
+            previous_label = "O"
+            continue
+
+        prefix = "B-" if previous_label != label else "I-"
+        labels.append(prefix + label)
+        previous_label = label
+
+    return words, labels
+
+
+def build_odrl_record_from_entities(
+    text: str,
+    entities: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Convert a span-annotated record into the JSONL ODRL dataset shape."""
+    words, labels = _spans_to_bio_over_words(text, entities)
+    rules = format_odrl_rules(text, words, labels)
+
+    odrl_rules: list[dict[str, str]] = []
+    for index, rule in enumerate(rules, 1):
+        odrl_rule = {field: "" for field in ("policy_rule_id", *ODRL_FIELDS)}
+        odrl_rule["policy_rule_id"] = f"policy-rule-{index}"
+        for field in ODRL_FIELDS:
+            odrl_rule[field] = _compact(rule.get(field))
+        odrl_rules.append(odrl_rule)
+
+    return {"text": text, "odrl": odrl_rules}
+
+
+def _rule_signature(rule: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(_compact(rule.get(field)) for field in ODRL_FIELDS)
+
+
+def _rule_view(rule: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: _compact(rule.get(field))
+        for field in ("policy_rule_id", *ODRL_FIELDS)
+    }
+
+
+def build_odrl_diff_record(state: dict[str, Any]) -> dict[str, Any]:
+    """Build a deterministic comparison for original vs corrected ODRL JSONL."""
+    original_record = dict(state.get("original_odrl_record") or {})
+    corrected_record = dict(
+        state.get("corrected_odrl_record") or state.get("text_odrl_record") or {}
+    )
+    text = _compact(
+        original_record.get("text")
+        or corrected_record.get("text")
+        or state.get("source_text")
+    )
+    original_rules = [
+        dict(rule)
+        for rule in original_record.get("odrl") or []
+        if isinstance(rule, dict)
+    ]
+    corrected_rules = [
+        dict(rule)
+        for rule in corrected_record.get("odrl") or []
+        if isinstance(rule, dict)
+    ]
+
+    unchanged: list[dict[str, Any]] = []
+    changed: list[dict[str, Any]] = []
+    added: list[dict[str, Any]] = []
+    deleted: list[dict[str, Any]] = []
+
+    shared_count = min(len(original_rules), len(corrected_rules))
+    for index in range(shared_count):
+        original = original_rules[index]
+        corrected = corrected_rules[index]
+        if _rule_signature(original) == _rule_signature(corrected):
+            unchanged.append({
+                "index": index,
+                "original_rule": _rule_view(original),
+                "correct_rule": _rule_view(corrected),
+            })
+            continue
+        field_changes = {
+            field: {
+                "from": _compact(original.get(field)),
+                "to": _compact(corrected.get(field)),
+            }
+            for field in ODRL_FIELDS
+            if _compact(original.get(field)) != _compact(corrected.get(field))
+        }
+        changed.append({
+            "index": index,
+            "change_types": sorted(field_changes),
+            "original_rule": _rule_view(original),
+            "correct_rule": _rule_view(corrected),
+            "field_changes": field_changes,
+        })
+
+    for index in range(shared_count, len(original_rules)):
+        deleted.append({
+            "index": index,
+            "original_rule": _rule_view(original_rules[index]),
+        })
+
+    for index in range(shared_count, len(corrected_rules)):
+        added.append({
+            "index": index,
+            "correct_rule": _rule_view(corrected_rules[index]),
+        })
+
+    return {
+        "record_index": int(state.get("record_index") or 0),
+        "origion_version": {
+            "text": text,
+            "odrl": original_rules,
+        },
+        "correct_version": {
+            "text": text,
+            "odrl": corrected_rules,
+        },
+        "diffs": {
+            "has_changes": bool(added or deleted or changed),
+            "summary": {
+                "original_rule_count": len(original_rules),
+                "correct_rule_count": len(corrected_rules),
+                "unchanged_count": len(unchanged),
+                "added_count": len(added),
+                "deleted_count": len(deleted),
+                "changed_count": len(changed),
+            },
+            "added": added,
+            "deleted": deleted,
+            "changed": changed,
+            "unchanged": unchanged,
+        },
+    }

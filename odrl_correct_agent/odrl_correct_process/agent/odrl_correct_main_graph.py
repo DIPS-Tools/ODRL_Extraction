@@ -27,15 +27,26 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from dotenv import load_dotenv
 
-from odrl_correct_agent.query_process.agent.nodes.node_initialize import node_initialize
-from odrl_correct_agent.query_process.agent.nodes.node_odrl_correct import node_odrl_correct
-from odrl_correct_agent.query_process.agent.nodes.node_odrl_extraction import node_odrl_extraction
-from odrl_correct_agent.query_process.agent.nodes.node_odrl_output import node_odrl_output
-from odrl_correct_agent.query_process.agent.state import (
+from odrl_correct_agent.odrl_correct_process.agent.batch_processing import (
+    finalize_batch_job,
+    prepare_batch_job,
+    refresh_batch_status,
+    submit_batch_job,
+    watch_and_finalize_batch_job,
+)
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_initialize import node_initialize
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_correct import node_odrl_correct
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_extraction import node_odrl_extraction
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_output import (
+    build_diff_record,
+    node_odrl_output,
+)
+from odrl_correct_agent.odrl_correct_process.agent.state import (
     ODRLCorrectionState,
     create_correction_state,
     default_prompt_path,
 )
+from odrl_output import build_odrl_diff_record, build_odrl_record_from_entities
 
 from odrl_correct_agent.utils.draw_mermaid_png import draw_mermaid_png
 
@@ -195,6 +206,28 @@ def odrl_output_path(
     )
 
 
+def diff_output_path(
+    dataset_path: Path,
+    output_dir: Path,
+    model_name: str,
+) -> Path:
+    """Return ``test_diffs_from_correct_{MODEL_NAME}.txt`` style output."""
+    return output_dir / (
+        f"{dataset_path.stem}_diffs_from_correct_{_safe_model_name(model_name)}.txt"
+    )
+
+
+def odrl_diff_output_path(
+    dataset_path: Path,
+    output_dir: Path,
+    model_name: str,
+) -> Path:
+    """Return ``test_odrl_diffs_from_correct_{MODEL_NAME}.txt`` style output."""
+    return output_dir / (
+        f"{dataset_path.stem}_odrl_diffs_from_correct_{_safe_model_name(model_name)}.txt"
+    )
+
+
 def _read_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -324,6 +357,8 @@ async def correct_dataset(
                 "correction_warnings": [f"{type(exc).__name__}: {exc}"],
             })
         states.append(state)
+        if not state.get("diff_record"):
+            state["diff_record"] = build_diff_record(state)
         corrected_record = state.get("corrected_record") or {}
         corrected_entities = (
             corrected_record.get("entities") or []
@@ -348,14 +383,49 @@ async def correct_dataset(
     )
     ner_path = corrected_output_path(source_path, destination, effective_model)
     text_odrl_path = odrl_output_path(source_path, destination, effective_model)
+    diff_path = diff_output_path(source_path, destination, effective_model)
     _write_jsonl_atomic(ner_path, (state["corrected_record"] for state in states))
     _write_jsonl_atomic(text_odrl_path, (state["text_odrl_record"] for state in states))
+    changed_states = [
+        state
+        for state in states
+        if (state.get("diff_record") or {}).get("diffs", {}).get("has_changes")
+    ]
+    _write_jsonl_atomic(
+        diff_path,
+        (state["diff_record"] for state in changed_states),
+    )
+    odrl_diff_path = odrl_diff_output_path(source_path, destination, effective_model)
+    for state in states:
+        original_record = state.get("input_record") or {}
+        state["original_odrl_record"] = build_odrl_record_from_entities(
+            str(original_record.get("text") or state.get("source_text") or ""),
+            list(original_record.get("entities") or []),
+        )
+        state["corrected_odrl_record"] = dict(state["text_odrl_record"] or {})
+        state["odrl_diff_record"] = build_odrl_diff_record(state)
+    changed_odrl_states = [
+        state
+        for state in states
+        if (state.get("odrl_diff_record") or {}).get("diffs", {}).get("has_changes")
+    ]
+    _write_jsonl_atomic(
+        odrl_diff_path,
+        (state["odrl_diff_record"] for state in changed_odrl_states),
+    )
+    for state in states:
+        state["diff_output_path"] = str(diff_path)
+        state["odrl_diff_output_path"] = str(odrl_diff_path)
     logger.info(
-        "dataset=%s status=completed records=%d ner_output=%s odrl_output=%s",
+        "dataset=%s status=completed records=%d changed_records=%d "
+        "ner_output=%s odrl_output=%s diff_output=%s odrl_diff_output=%s",
         source_path.name,
         len(states),
+        len(changed_states),
         ner_path,
         text_odrl_path,
+        diff_path,
+        odrl_diff_path,
     )
     return ner_path, text_odrl_path, states
 
@@ -424,6 +494,80 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, help="Process only the first N records.")
     parser.add_argument("--strict", action="store_true", help="Stop on the first failed record.")
     parser.add_argument(
+        "--batch-prepare",
+        action="store_true",
+        help=(
+            "Prepare local evidence, upload requests, and submit a paid discounted "
+            "OpenAI Batch job."
+        ),
+    )
+    parser.add_argument(
+        "--batch-run",
+        action="store_true",
+        help=(
+            "Prepare and submit a paid Batch, wait resumably for its remote "
+            "completion, then strictly finalize all outputs."
+        ),
+    )
+    parser.add_argument(
+        "--batch-prepare-only",
+        action="store_true",
+        help="Prepare Batch artifacts locally without uploading or making a paid API call.",
+    )
+    parser.add_argument(
+        "--batch-submit",
+        metavar="MANIFEST",
+        help="Submit a manifest created with --batch-prepare-only.",
+    )
+    parser.add_argument(
+        "--batch-status",
+        metavar="MANIFEST",
+        help="Refresh the remote status stored in a Batch manifest.",
+    )
+    parser.add_argument(
+        "--batch-finalize",
+        metavar="MANIFEST",
+        help="Download a completed Batch and write corrected split outputs.",
+    )
+    parser.add_argument(
+        "--batch-watch-finalize",
+        metavar="MANIFEST",
+        help=(
+            "Resume polling a submitted Batch manifest and automatically "
+            "finalize it after completion."
+        ),
+    )
+    parser.add_argument(
+        "--batch-poll-seconds",
+        type=float,
+        default=float(os.getenv("ODRL_BATCH_POLL_SECONDS", "300")),
+        help="Seconds between successful Batch status polls (default: 300).",
+    )
+    parser.add_argument(
+        "--batch-watch-timeout-hours",
+        type=float,
+        default=float(os.getenv("ODRL_BATCH_WATCH_TIMEOUT_HOURS", "26")),
+        help=(
+            "Local watcher timeout; it never cancels the remote Batch "
+            "(default: 26 hours)."
+        ),
+    )
+    parser.add_argument(
+        "--batch-max-consecutive-errors",
+        type=int,
+        default=int(os.getenv("ODRL_BATCH_MAX_CONSECUTIVE_ERRORS", "12")),
+        help="Stop the local watcher after this many polling errors (default: 12).",
+    )
+    parser.add_argument(
+        "--batch-job-dir",
+        help="Directory for request, state, result, and manifest Batch artifacts.",
+    )
+    parser.add_argument(
+        "--allow-batch-fallbacks",
+        action="store_true",
+        help="Allow failed/truncated Batch records to use endpoint/original fallback data.",
+    )
+    parser.add_argument(
         "--log-level",
         default=os.getenv("ODRL_CORRECTION_LOG_LEVEL", "INFO").upper(),
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
@@ -433,13 +577,131 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 async def _async_main(args: argparse.Namespace) -> int:
+    batch_actions = [
+        args.batch_prepare,
+        args.batch_run,
+        args.batch_prepare_only,
+        bool(args.batch_submit),
+        bool(args.batch_status),
+        bool(args.batch_finalize),
+        bool(args.batch_watch_finalize),
+    ]
+    if sum(bool(action) for action in batch_actions) > 1:
+        raise ValueError("Select only one Batch action at a time.")
     if args.dataset and args.all_splits:
         raise ValueError("Use either --dataset or --all-splits, not both.")
+    if args.limit is not None and args.limit <= 0:
+        raise ValueError("--limit must be greater than zero.")
+    if args.batch_submit:
+        manifest = submit_batch_job(args.batch_submit)
+        print(f"Batch submitted: {manifest['batch_id']}")
+        print(f"Status: {manifest['status']}")
+        print(f"Manifest: {Path(args.batch_submit).expanduser().resolve()}")
+        return 0
+    if args.batch_status:
+        manifest = refresh_batch_status(args.batch_status)
+        print(f"Batch ID: {manifest['batch_id']}")
+        print(f"Status: {manifest['status']}")
+        print(f"Request counts: {manifest.get('request_counts') or {}}")
+        return 0
+    if args.batch_watch_finalize:
+        manifest = await watch_and_finalize_batch_job(
+            args.batch_watch_finalize,
+            poll_interval_seconds=args.batch_poll_seconds,
+            timeout_hours=args.batch_watch_timeout_hours,
+            max_consecutive_errors=args.batch_max_consecutive_errors,
+            strict=not args.allow_batch_fallbacks,
+        )
+        print(f"Finalized {manifest.get('request_count') or 0} Batch record(s).")
+        for key, label in (
+            ("ner_outputs", "NER dataset"),
+            ("odrl_outputs", "Text-to-ODRL dataset"),
+            ("diff_outputs", "Correction diff dataset"),
+            ("odrl_diff_outputs", "ODRL correction diff dataset"),
+        ):
+            for output_path in manifest.get(key) or []:
+                print(f"{label}: {output_path}")
+        print(
+            f"Manifest: {Path(args.batch_watch_finalize).expanduser().resolve()}"
+        )
+        return 0
+    if args.batch_finalize:
+        ner_paths, odrl_paths, states = await finalize_batch_job(
+            args.batch_finalize,
+            strict=not args.allow_batch_fallbacks,
+        )
+        finalized_manifest = json.loads(
+            Path(args.batch_finalize).expanduser().resolve().read_text(
+                encoding="utf-8"
+            )
+        )
+        print(f"Finalized {len(states)} Batch record(s).")
+        for output_path in ner_paths:
+            print(f"NER dataset: {output_path}")
+        for output_path in odrl_paths:
+            print(f"Text-to-ODRL dataset: {output_path}")
+        for output_path in finalized_manifest.get("diff_outputs") or []:
+            print(f"Correction diff dataset: {output_path}")
+        for output_path in finalized_manifest.get("odrl_diff_outputs") or []:
+            print(f"ODRL correction diff dataset: {output_path}")
+        print(f"Manifest: {Path(args.batch_finalize).expanduser().resolve()}")
+        return 0
+    if args.batch_prepare or args.batch_prepare_only or args.batch_run:
+        if not args.dataset and not args.all_splits:
+            raise ValueError(
+                "Batch preparation requires --dataset or --all-splits."
+            )
+        dataset_paths = (
+            [Path(args.data_dir) / name for name in ("train.txt", "valid.txt", "test.txt")]
+            if args.all_splits
+            else [Path(args.dataset)]
+        )
+        manifest_path = await prepare_batch_job(
+            dataset_paths,
+            output_dir=args.output_dir,
+            job_dir=args.batch_job_dir,
+            prompt_path=args.prompt,
+            model_name=args.model_name,
+            endpoint=args.endpoint,
+            call_endpoint=not args.skip_endpoint,
+            limit=args.limit,
+            submit=args.batch_prepare or args.batch_run,
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        print(
+            f"Prepared {manifest['request_count']} Batch request(s).",
+            flush=True,
+        )
+        print(f"Manifest: {manifest_path}", flush=True)
+        print(f"Requests: {manifest['requests_path']}", flush=True)
+        if args.batch_prepare or args.batch_run:
+            print(f"Batch submitted: {manifest['batch_id']}", flush=True)
+            print(f"Status: {manifest['status']}", flush=True)
+        else:
+            print("No API call was made. Use --batch-submit MANIFEST to submit it.")
+        if args.batch_run:
+            finalized = await watch_and_finalize_batch_job(
+                manifest_path,
+                poll_interval_seconds=args.batch_poll_seconds,
+                timeout_hours=args.batch_watch_timeout_hours,
+                max_consecutive_errors=args.batch_max_consecutive_errors,
+                strict=not args.allow_batch_fallbacks,
+            )
+            print(
+                f"Finalized {finalized.get('request_count') or 0} Batch record(s)."
+            )
+            for key, label in (
+                ("ner_outputs", "NER dataset"),
+                ("odrl_outputs", "Text-to-ODRL dataset"),
+                ("diff_outputs", "Correction diff dataset"),
+                ("odrl_diff_outputs", "ODRL correction diff dataset"),
+            ):
+                for output_path in finalized.get(key) or []:
+                    print(f"{label}: {output_path}")
+        return 0
     if not args.dataset and not args.all_splits:
         await run_demo()
         return 0
-    if args.limit is not None and args.limit <= 0:
-        raise ValueError("--limit must be greater than zero.")
     options = {
         "output_dir": args.output_dir,
         "prompt_path": args.prompt,
@@ -467,6 +729,16 @@ async def _async_main(args: argparse.Namespace) -> int:
         print(f"NER dataset: {ner_path}")
     for text_odrl_path in text_odrl_paths:
         print(f"Text-to-ODRL dataset: {text_odrl_path}")
+    diff_paths = dict.fromkeys(
+        str(state.get("diff_output_path") or "")
+        for state in states
+        if state.get("diff_output_path")
+    )
+    for diff_path in diff_paths:
+        print(f"Correction diff dataset: {diff_path}")
+    for state in states:
+        if state.get("odrl_diff_output_path"):
+            print(f"ODRL correction diff dataset: {state['odrl_diff_output_path']}")
     print(f"Warnings: {warnings}")
     return 0
 
@@ -483,19 +755,185 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-# python -m odrl_correct_agent.query_process.agent.odrl_correct_main_graph \
+# python -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
 #     --all-splits \
 #     --data-dir data
 #
-#   python -m odrl_correct_agent.query_process.agent.odrl_correct_main_graph
+#   python -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph
 #
 #   Correct only test.txt:
 #
-#   python -m odrl_correct_agent.query_process.agent.odrl_correct_main_graph \
+#   python -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
 #     --dataset data/test.txt
 #
 #   Correct all splits:
 #
-#   python -m odrl_correct_agent.query_process.agent.odrl_correct_main_graph \
+#   python -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
 #     --all-splits \
 #     --data-dir data
+
+#   ### 1. Verify the old ODRL model endpoint
+#
+#   curl -sS -X POST \
+#     http://127.0.0.1:5001/odrl_generation \
+#     -H 'Content-Type: application/json' \
+#     -d '{"text":"The document may be downloaded for research purposes."}'
+#
+#   Do not begin Batch preparation until this returns a valid "rules" result.
+#
+#   ### 2. Prepare and submit the Batch in the background
+#
+#   nohup .venv/bin/python -u \
+#     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+#     --batch-prepare \
+#     --all-splits \
+#     --data-dir data \
+#     --log-level INFO \
+#     > odrl_batch_prepare.log 2>&1 &
+#
+#   echo $! > odrl_batch_prepare.pid
+#
+#   Monitor preparation:
+#
+#   tail -f odrl_batch_prepare.log
+#
+#   Stop following the log with Ctrl+C. This does not stop the background process.
+#
+#   When finished successfully, the log will contain:
+#
+#   Prepared 4834 Batch request(s).
+#   Manifest: /.../data/batch_jobs/odrl_gpt-5.6-luna_.../manifest.json
+#   Batch submitted: batch_...
+#   Status: validating
+#
+#   Extract the manifest path:
+#
+#   MANIFEST="$(awk -F'Manifest: ' '/^Manifest: /{path=$2} END{print path}' odrl_batch_prepare.log)"
+#   echo "$MANIFEST"
+#
+#   ### 3. Check the OpenAI Batch status
+#
+  # .venv/bin/python \
+  #   -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+  #   --batch-status "$MANIFEST"
+#
+#   Run this periodically until it reports:
+#
+#   Status: completed
+#
+#   The preparation process exits after submission; this is expected. OpenAI continues processing the Batch remotely.
+#
+#   ### 4. Finalize in the background
+#
+#   After the status is completed:
+#
+#   nohup .venv/bin/python -u \
+#     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+#     --batch-finalize "$MANIFEST" \
+#     --log-level INFO \
+#     > odrl_batch_finalize.log 2>&1 &
+#
+#   echo $! > odrl_batch_finalize.pid
+#
+#   Monitor finalization:
+#
+#   tail -f odrl_batch_finalize.log
+#
+#   ### 5. Check the final files
+#
+#   ls -lh \
+#     data/*_correct_with_agent_gpt-5.6-luna.txt \
+#     data/*_odrl_with_agent_gpt-5.6-luna.txt \
+#     data/*_diffs_from_correct_gpt-5.6-luna.txt
+#
+#   The final outputs will be:
+#
+#   data/train_correct_with_agent_gpt-5.6-luna.txt
+#   data/valid_correct_with_agent_gpt-5.6-luna.txt
+#   data/test_correct_with_agent_gpt-5.6-luna.txt
+#
+#   data/train_odrl_with_agent_gpt-5.6-luna.txt
+#   data/valid_odrl_with_agent_gpt-5.6-luna.txt
+#   data/test_odrl_with_agent_gpt-5.6-luna.txt
+#
+#   data/train_diffs_from_correct_gpt-5.6-luna.txt
+#   data/valid_diffs_from_correct_gpt-5.6-luna.txt
+#   data/test_diffs_from_correct_gpt-5.6-luna.txt
+#
+#   Do not add --allow-batch-fallbacks if maximum corrected-dataset quality is the priority.
+# --------------------------------------------
+#  echo $! > odrl_batch_run.pid
+#
+#   saves the process ID of the most recently started background command into odrl_batch_run.pid.
+#
+#   - $! — PID of the last background process
+#   - > — writes to a file, replacing existing content
+#   - odrl_batch_run.pid — file containing that PID
+#
+#   For example:
+#
+#   18432
+#
+#   You can later check whether it is running:
+#
+#   ps -p "$(cat odrl_batch_run.pid)" -f
+#
+#   Or stop the local process:
+#
+#   kill "$(cat odrl_batch_run.pid)"
+#
+#   Stopping it does not cancel an OpenAI Batch that has already been submitted.
+
+# The cause is that $MANIFEST was empty, so the program did not recognize a valid --batch-finalize action.
+#
+#   Check it:
+#
+#   echo "$MANIFEST"
+#
+#   Recover the manifest from your log:
+#
+#   MANIFEST="$(sed -n 's/^Manifest: //p' odrl_batch_run.log | tail -1)"
+#   echo "$MANIFEST"
+#   test -f "$MANIFEST" && echo "Manifest found"
+#
+#   Check the Batch status:
+#
+#   .venv/bin/python \
+#     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+#     --batch-status "$MANIFEST"
+#
+#   Only when it reports Status: completed, finalize with:
+#
+#   .venv/bin/python \
+#     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+#     --batch-finalize "$MANIFEST"
+#
+#   However, if you started with --batch-run, it already waits and finalizes automatically. You normally only need:
+#
+#   tail -f odrl_batch_run.log
+
+
+# $MANIFEST is not automatically created as a shell variable. The manifest file is created only after all records have completed local endpoint preparation.
+#
+#   Check progress:
+#
+#   tail -f odrl_batch_run.log
+#
+#   Check whether the process is still running:
+#
+#   ps -p "$(cat odrl_batch_run.pid)" -f
+#
+#   Eventually the log will show:
+#
+#   Prepared 4834 Batch request(s).
+#   Manifest: /.../data/batch_jobs/odrl_gpt-5.6-luna_.../manifest.json
+#   Batch submitted: batch_...
+#
+#   Then you can extract it:
+#
+#   MANIFEST="$(sed -n 's/^Manifest: //p' odrl_batch_run.log | tail -1)"
+#   echo "$MANIFEST"
+#
+#   With --batch-run, you do not need to run --batch-finalize manually. It will wait and finalize automatically. If the background process has stopped, inspect the error with:
+#
+#   tail -n 100 odrl_batch_run.log

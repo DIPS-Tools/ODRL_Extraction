@@ -38,6 +38,12 @@ class ODRLCorrectionState(TypedDict, total=False):
     corrected_entities: list[dict[str, Any]]
     corrected_record: dict[str, Any]
     text_odrl_record: dict[str, Any]
+    diff_record: dict[str, Any]
+    original_odrl_record: dict[str, Any]
+    corrected_odrl_record: dict[str, Any]
+    odrl_diff_record: dict[str, Any]
+    diff_output_path: str
+    odrl_diff_output_path: str
 
 
 def default_prompt_path() -> Path:
@@ -75,6 +81,12 @@ def create_correction_state(
         "corrected_entities": [],
         "corrected_record": {},
         "text_odrl_record": {},
+        "diff_record": {},
+        "original_odrl_record": {},
+        "corrected_odrl_record": {},
+        "odrl_diff_record": {},
+        "diff_output_path": "",
+        "odrl_diff_output_path": "",
     }
     state.update(overrides)
     return state

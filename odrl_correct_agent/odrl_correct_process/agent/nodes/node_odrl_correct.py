@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from openai import AsyncOpenAI
 
-from odrl_correct_agent.query_process.agent.state import ODRLCorrectionState
+from odrl_correct_agent.odrl_correct_process.agent.state import ODRLCorrectionState
 
 
 RULE_FIELDS = (
@@ -180,10 +180,30 @@ async def _call_ai(prompt: str, model_name: str) -> dict[str, Any]:
         os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE") or ""
     ).strip()
     client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+    request = build_chat_completion_request(prompt, model_name)
+    response = await client.chat.completions.create(**request)
+    if not response.choices:
+        raise ValueError("AI correction returned no choices.")
+    return parse_ai_response(response.choices[0].message.content)
+
+
+def build_chat_completion_request(prompt: str, model_name: str) -> dict[str, Any]:
+    """Build the identical request body used by synchronous and Batch calls."""
     request: dict[str, Any] = {
         "model": model_name,
         "messages": [{"role": "user", "content": prompt}],
     }
+    reasoning_effort = str(
+        os.getenv("ODRL_CORRECTION_REASONING_EFFORT") or ""
+    ).strip().lower()
+    if reasoning_effort:
+        allowed_efforts = {"none", "low", "medium", "high", "xhigh", "max"}
+        if reasoning_effort not in allowed_efforts:
+            raise ValueError(
+                "ODRL_CORRECTION_REASONING_EFFORT must be one of: "
+                + ", ".join(sorted(allowed_efforts))
+            )
+        request["reasoning_effort"] = reasoning_effort
     temperature = str(os.getenv("ODRL_CORRECTION_TEMPERATURE") or "").strip()
     if temperature:
         request["temperature"] = float(temperature)
@@ -194,10 +214,7 @@ async def _call_ai(prompt: str, model_name: str) -> dict[str, Any]:
         request["max_completion_tokens"] = int(max_output_tokens)
     if os.getenv("ODRL_CORRECTION_JSON_MODE", "true").lower() == "true":
         request["response_format"] = {"type": "json_object"}
-    response = await client.chat.completions.create(**request)
-    if not response.choices:
-        raise ValueError("AI correction returned no choices.")
-    return parse_ai_response(response.choices[0].message.content)
+    return request
 
 
 def _quote_pattern(quote: str) -> re.Pattern[str] | None:

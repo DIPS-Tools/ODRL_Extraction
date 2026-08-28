@@ -148,6 +148,7 @@ Thumbs.db
 /row_data_processing/
 /save_model_only_constrain/
 /logs/
+/data/batch_jobs/
 /data/data_v1/
 /data/data_v2/
 /data/data_v3/
