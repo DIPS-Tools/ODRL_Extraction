@@ -1,0 +1,67 @@
+{
+  "source_data_dir": "/local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data",
+  "output_dir": "/local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/deduplicated_gpt-5.6-luna",
+  "model_suffix": "gpt-5.6-luna",
+  "split_priority": [
+    "test",
+    "valid",
+    "train"
+  ],
+  "selection_policy": "Existing correction with minimum total entity symmetric difference; ties prefer exact votes, ODRL agreement, valid/non-overlapping spans, split priority, and source index. Review conflicts before treating automatic selections as definitive human gold.",
+  "source_record_count": 4834,
+  "unique_text_count": 3758,
+  "removed_duplicate_count": 1076,
+  "duplicate_text_group_count": 318,
+  "corrected_gold_conflict_count": 237,
+  "unresolved_gold_conflict_count": 237,
+  "manual_decision_count": 0,
+  "require_reviewed_gold": false,
+  "counts": {
+    "train": {
+      "source_rows": 3867,
+      "deduplicated_rows": 2923,
+      "removed_rows": 944,
+      "ner_diff_rows": 2890,
+      "odrl_diff_rows": 2923
+    },
+    "valid": {
+      "source_rows": 483,
+      "deduplicated_rows": 400,
+      "removed_rows": 83,
+      "ner_diff_rows": 393,
+      "odrl_diff_rows": 400
+    },
+    "test": {
+      "source_rows": 484,
+      "deduplicated_rows": 435,
+      "removed_rows": 49,
+      "ner_diff_rows": 430,
+      "odrl_diff_rows": 435
+    }
+  },
+  "audit_files": {
+    "duplicates": "data/deduplicated_gpt-5.6-luna/duplicate_samples.jsonl",
+    "corrected_gold_conflicts": "data/deduplicated_gpt-5.6-luna/corrected_gold_conflicts.jsonl",
+    "gold_decisions_template": "data/deduplicated_gpt-5.6-luna/gold_decisions_template.json"
+  },
+  "output_files": [
+    "data/deduplicated_gpt-5.6-luna/train.txt",
+    "data/deduplicated_gpt-5.6-luna/train_odrl.txt",
+    "data/deduplicated_gpt-5.6-luna/train_correct_with_agent_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/train_odrl_with_agent_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/train_diffs_from_correct_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/train_odrl_diffs_from_correct_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/valid.txt",
+    "data/deduplicated_gpt-5.6-luna/valid_odrl.txt",
+    "data/deduplicated_gpt-5.6-luna/valid_correct_with_agent_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/valid_odrl_with_agent_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/valid_diffs_from_correct_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/valid_odrl_diffs_from_correct_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/test.txt",
+    "data/deduplicated_gpt-5.6-luna/test_odrl.txt",
+    "data/deduplicated_gpt-5.6-luna/test_correct_with_agent_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/test_odrl_with_agent_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/test_diffs_from_correct_gpt-5.6-luna.txt",
+    "data/deduplicated_gpt-5.6-luna/test_odrl_diffs_from_correct_gpt-5.6-luna.txt"
+  ]
+}

@@ -5,6 +5,7 @@ Workflow:
       -> node_initialize
       -> node_odrl_extraction
       -> node_odrl_correct
+      -> node_flat_ner_validate
       -> node_odrl_output
       -> __end__
 
@@ -35,11 +36,20 @@ from odrl_correct_agent.odrl_correct_process.agent.batch_processing import (
     watch_and_finalize_batch_job,
 )
 from odrl_correct_agent.odrl_correct_process.agent.sharded_batch import (
+    refinalize_recovery_batch_job,
+    run_primary_sharded_batch_job,
+    run_recovery_batch_job,
     run_sharded_batch_job,
 )
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_initialize import node_initialize
-from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_correct import node_odrl_correct
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_correct import (
+    compare_entity_sets,
+    node_odrl_correct,
+)
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_extraction import node_odrl_extraction
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_flat_ner_validate import (
+    node_flat_ner_validate,
+)
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_output import (
     build_diff_record,
     node_odrl_output,
@@ -60,6 +70,7 @@ WORKFLOW_NODE_NAMES = (
     "node_initialize",
     "node_odrl_extraction",
     "node_odrl_correct",
+    "node_flat_ner_validate",
     "node_odrl_output",
     "__end__",
 )
@@ -67,6 +78,7 @@ WORKFLOW_NODES: tuple[Node, ...] = (
     node_initialize,
     node_odrl_extraction,
     node_odrl_correct,
+    node_flat_ner_validate,
     node_odrl_output,
 )
 
@@ -284,6 +296,8 @@ async def correct_dataset(
     limit: int | None = None,
     strict: bool = False,
     ai_response_override: dict[str, Any] | None = None,
+    gold_cache: dict[str, dict[str, Any]] | None = None,
+    duplicate_variants_by_text: dict[str, list[list[dict[str, Any]]]] | None = None,
 ) -> tuple[Path, Path, list[ODRLCorrectionState]]:
     """Correct one JSONL dataset and write NER plus text-to-ODRL files."""
     source_path = Path(dataset_path).expanduser().resolve()
@@ -291,6 +305,17 @@ async def correct_dataset(
         raise FileNotFoundError(f"Dataset not found: {source_path}")
     destination = Path(output_dir).expanduser().resolve() if output_dir else source_path.parent
     records = _read_jsonl(source_path, limit=limit)
+    original_odrl_path = source_path.with_name(f"{source_path.stem}_odrl.txt")
+    original_odrl_records = (
+        _read_jsonl(original_odrl_path, limit=limit)
+        if original_odrl_path.is_file()
+        else []
+    )
+    if original_odrl_records and len(original_odrl_records) != len(records):
+        raise ValueError(
+            f"{original_odrl_path} has {len(original_odrl_records)} records; "
+            f"expected {len(records)} to align with {source_path}"
+        )
     workflow = correct_agent_app
     states: list[ODRLCorrectionState] = []
 
@@ -320,18 +345,69 @@ async def correct_dataset(
             source_preview,
         )
         try:
-            state = await workflow.ainvoke(
-                record,
-                record_index=index,
-                record_total=len(records),
-                dataset_path=str(source_path),
-                output_dir=str(destination),
-                prompt_path=str(prompt_path or default_prompt_path()),
-                model_name=model_name,
-                endpoint=endpoint,
-                call_endpoint=call_endpoint,
-                ai_response_override=ai_response_override,
-            )
+            source_text = str(record.get("text") or "")
+            cached = (gold_cache or {}).get(source_text)
+            if cached is None:
+                state = await workflow.ainvoke(
+                    record,
+                    record_index=index,
+                    record_total=len(records),
+                    dataset_path=str(source_path),
+                    output_dir=str(destination),
+                    prompt_path=str(prompt_path or default_prompt_path()),
+                    model_name=model_name,
+                    endpoint=endpoint,
+                    call_endpoint=call_endpoint,
+                    ai_response_override=ai_response_override,
+                    duplicate_original_variants=list(
+                        (duplicate_variants_by_text or {}).get(source_text) or []
+                    ),
+                )
+                if gold_cache is not None:
+                    gold_cache[source_text] = {
+                        "validated_policy_rules": [
+                            dict(rule) for rule in state.get("validated_policy_rules") or []
+                        ],
+                        "corrected_entities": [
+                            dict(entity) for entity in state.get("corrected_entities") or []
+                        ],
+                        "selected_from": state.get("selected_from"),
+                        "correction_warnings": list(
+                            state.get("correction_warnings") or []
+                        ),
+                    }
+            else:
+                state = create_correction_state(
+                    record,
+                    record_index=index,
+                    record_total=len(records),
+                    dataset_path=str(source_path),
+                    output_dir=str(destination),
+                    model_name=requested_model,
+                )
+                state.update({
+                    "source_text": source_text,
+                    "original_entities": [
+                        dict(entity) for entity in record.get("entities") or []
+                    ],
+                    "validated_policy_rules": [
+                        dict(rule) for rule in cached.get("validated_policy_rules") or []
+                    ],
+                    "corrected_entities": [
+                        dict(entity) for entity in cached.get("corrected_entities") or []
+                    ],
+                    "selected_from": "duplicate_gold_reuse",
+                    "correction_warnings": list(
+                        cached.get("correction_warnings") or []
+                    ),
+                    "flat_ner_validated": True,
+                    "overlap_count": 0,
+                })
+                state["correction_comparison"] = compare_entity_sets(
+                    list(state.get("original_entities") or []),
+                    list(state.get("corrected_entities") or []),
+                )
+                state.update(await node_odrl_output(state))
         except Exception as exc:
             if strict:
                 raise RuntimeError(
@@ -360,6 +436,8 @@ async def correct_dataset(
                 "correction_warnings": [f"{type(exc).__name__}: {exc}"],
             })
         states.append(state)
+        if original_odrl_records:
+            state["original_odrl_record"] = original_odrl_records[index - 1]
         if not state.get("diff_record"):
             state["diff_record"] = build_diff_record(state)
         corrected_record = state.get("corrected_record") or {}
@@ -401,9 +479,12 @@ async def correct_dataset(
     odrl_diff_path = odrl_diff_output_path(source_path, destination, effective_model)
     for state in states:
         original_record = state.get("input_record") or {}
-        state["original_odrl_record"] = build_odrl_record_from_entities(
-            str(original_record.get("text") or state.get("source_text") or ""),
-            list(original_record.get("entities") or []),
+        state["original_odrl_record"] = dict(
+            state.get("original_odrl_record")
+            or build_odrl_record_from_entities(
+                str(original_record.get("text") or state.get("source_text") or ""),
+                list(original_record.get("entities") or []),
+            )
         )
         state["corrected_odrl_record"] = dict(state["text_odrl_record"] or {})
         state["odrl_diff_record"] = build_odrl_diff_record(state)
@@ -439,12 +520,31 @@ async def correct_all_splits(
 ) -> tuple[list[Path], list[Path], list[ODRLCorrectionState]]:
     """Correct train/valid/test and write model-specific files per split."""
     source_dir = Path(data_dir).expanduser().resolve()
+    source_paths = [source_dir / name for name in ("train.txt", "valid.txt", "test.txt")]
+    variants_by_text: dict[str, list[list[dict[str, Any]]]] = {}
+    variant_signatures: dict[str, set[tuple[tuple[int, int, str], ...]]] = {}
+    for source_path in source_paths:
+        for record in _read_jsonl(source_path, limit=options.get("limit")):
+            text_value = str(record.get("text") or "")
+            entities = [dict(entity) for entity in record.get("entities") or []]
+            signature = tuple(sorted(
+                (int(entity["start"]), int(entity["end"]), str(entity["label"]))
+                for entity in entities
+            ))
+            seen = variant_signatures.setdefault(text_value, set())
+            if signature not in seen:
+                variants_by_text.setdefault(text_value, []).append(entities)
+                seen.add(signature)
+
+    gold_cache: dict[str, dict[str, Any]] = {}
     ner_paths: list[Path] = []
     odrl_paths: list[Path] = []
     all_states: list[ODRLCorrectionState] = []
     for filename in ("train.txt", "valid.txt", "test.txt"):
         ner_path, odrl_path, states = await correct_dataset(
             source_dir / filename,
+            gold_cache=gold_cache,
+            duplicate_variants_by_text=variants_by_text,
             **options,
         )
         ner_paths.append(ner_path)
@@ -545,7 +645,32 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MANIFEST",
         help=(
             "Split an already prepared manifest into prompt-token-bounded "
-            "shards, run them sequentially, and merge all final outputs."
+            "primary shards, run them sequentially, recover invalid records "
+            "with one discounted Batch, and merge all final outputs."
+        ),
+    )
+    parser.add_argument(
+        "--batch-shard-primary-run",
+        metavar="MANIFEST",
+        help=(
+            "Run/finalize all primary shards and prepare local recovery Batch "
+            "artifacts, but do not submit the recovery Batch."
+        ),
+    )
+    parser.add_argument(
+        "--batch-recovery-run",
+        metavar="MANIFEST",
+        help=(
+            "Submit/resume the prepared recovery Batch from a sharded parent "
+            "manifest, validate its results, and merge final outputs."
+        ),
+    )
+    parser.add_argument(
+        "--batch-recovery-refinalize",
+        metavar="MANIFEST",
+        help=(
+            "Revalidate already downloaded primary and recovery results with "
+            "the current local rules; makes no OpenAI API calls."
         ),
     )
     parser.add_argument(
@@ -603,6 +728,9 @@ async def _async_main(args: argparse.Namespace) -> int:
         bool(args.batch_finalize),
         bool(args.batch_watch_finalize),
         bool(args.batch_shard_run),
+        bool(args.batch_shard_primary_run),
+        bool(args.batch_recovery_run),
+        bool(args.batch_recovery_refinalize),
     ]
     if sum(bool(action) for action in batch_actions) > 1:
         raise ValueError("Select only one Batch action at a time.")
@@ -612,6 +740,59 @@ async def _async_main(args: argparse.Namespace) -> int:
         raise ValueError("--limit must be greater than zero.")
     if args.batch_shard_max_prompt_tokens <= 0:
         raise ValueError("--batch-shard-max-prompt-tokens must be greater than zero.")
+    if args.batch_recovery_refinalize:
+        manifest = await refinalize_recovery_batch_job(
+            args.batch_recovery_refinalize
+        )
+        print(
+            f"Offline re-finalization completed for "
+            f"{manifest.get('expanded_record_count') or 0} source record(s)."
+        )
+        print("No OpenAI API call was made.")
+        print(f"Parent manifest: {Path(args.batch_recovery_refinalize).expanduser().resolve()}")
+        return 0
+    if args.batch_shard_primary_run:
+        manifest = await run_primary_sharded_batch_job(
+            args.batch_shard_primary_run,
+            maximum_prompt_tokens=args.batch_shard_max_prompt_tokens,
+            poll_interval_seconds=args.batch_poll_seconds,
+            timeout_hours=args.batch_watch_timeout_hours,
+            max_consecutive_errors=args.batch_max_consecutive_errors,
+            strict=not args.allow_batch_fallbacks,
+        )
+        print(f"Primary shards completed: {manifest.get('completed_shards') or 0}")
+        print(f"Recovery candidates: {manifest.get('recovery_request_count') or 0}")
+        recovery_manifest = manifest.get("recovery_manifest_path")
+        if recovery_manifest:
+            recovery = json.loads(Path(str(recovery_manifest)).read_text(encoding="utf-8"))
+            print(f"Recovery manifest: {recovery_manifest}")
+            print(f"Recovery requests: {recovery.get('requests_path')}")
+            print("No recovery API call was made.")
+        else:
+            print("No recovery candidates were found; final outputs are complete.")
+        print(f"Parent manifest: {Path(args.batch_shard_primary_run).expanduser().resolve()}")
+        return 0
+    if args.batch_recovery_run:
+        manifest = await run_recovery_batch_job(
+            args.batch_recovery_run,
+            poll_interval_seconds=args.batch_poll_seconds,
+            timeout_hours=args.batch_watch_timeout_hours,
+        )
+        print(
+            f"Finalized {manifest.get('expanded_record_count') or manifest.get('source_record_count') or 0} "
+            "source record(s) after recovery."
+        )
+        print(f"Recovery candidates: {manifest.get('recovery_request_count') or 0}")
+        for key, label in (
+            ("ner_outputs", "NER dataset"),
+            ("odrl_outputs", "Text-to-ODRL dataset"),
+            ("diff_outputs", "Correction diff dataset"),
+            ("odrl_diff_outputs", "ODRL correction diff dataset"),
+        ):
+            for output_path in manifest.get(key) or []:
+                print(f"{label}: {output_path}")
+        print(f"Parent manifest: {Path(args.batch_recovery_run).expanduser().resolve()}")
+        return 0
     if args.batch_shard_run:
         manifest = await run_sharded_batch_job(
             args.batch_shard_run,
@@ -621,7 +802,10 @@ async def _async_main(args: argparse.Namespace) -> int:
             max_consecutive_errors=args.batch_max_consecutive_errors,
             strict=not args.allow_batch_fallbacks,
         )
-        print(f"Finalized {manifest.get('request_count') or 0} sharded Batch record(s).")
+        print(
+            f"Finalized {manifest.get('expanded_record_count') or manifest.get('source_record_count') or 0} "
+            f"source record(s) from {manifest.get('request_count') or 0} unique-text request(s)."
+        )
         print(f"Shards: {manifest.get('shard_count') or 0}")
         for key, label in (
             ("ner_outputs", "NER dataset"),
@@ -653,7 +837,10 @@ async def _async_main(args: argparse.Namespace) -> int:
             max_consecutive_errors=args.batch_max_consecutive_errors,
             strict=not args.allow_batch_fallbacks,
         )
-        print(f"Finalized {manifest.get('request_count') or 0} Batch record(s).")
+        print(
+            f"Finalized {manifest.get('expanded_record_count') or manifest.get('source_record_count') or 0} "
+            f"source record(s) from {manifest.get('request_count') or 0} unique-text request(s)."
+        )
         for key, label in (
             ("ner_outputs", "NER dataset"),
             ("odrl_outputs", "Text-to-ODRL dataset"),
@@ -710,7 +897,8 @@ async def _async_main(args: argparse.Namespace) -> int:
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         print(
-            f"Prepared {manifest['request_count']} Batch request(s).",
+            f"Prepared {manifest['request_count']} unique-text Batch request(s) "
+            f"for {manifest.get('source_record_count', manifest['request_count'])} source record(s).",
             flush=True,
         )
         print(f"Manifest: {manifest_path}", flush=True)
@@ -729,7 +917,8 @@ async def _async_main(args: argparse.Namespace) -> int:
                 strict=not args.allow_batch_fallbacks,
             )
             print(
-                f"Finalized {finalized.get('request_count') or 0} Batch record(s)."
+                f"Finalized {finalized.get('expanded_record_count') or finalized.get('source_record_count') or 0} "
+                f"source record(s) from {finalized.get('request_count') or 0} unique-text request(s)."
             )
             for key, label in (
                 ("ner_outputs", "NER dataset"),
@@ -978,3 +1167,127 @@ if __name__ == "__main__":
 #   With --batch-run, you do not need to run --batch-finalize manually. It will wait and finalize automatically. If the background process has stopped, inspect the error with:
 #
 #   tail -n 100 odrl_batch_run.log
+
+
+#   MANIFEST="$(sed -n 's/^Manifest: //p' odrl_gold_prepare.log | tail -1)"
+#   echo "$MANIFEST"
+#
+#   Then, for the real run:
+#
+#   nohup .venv/bin/python -u \
+#     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+#     --batch-shard-run "$MANIFEST" \
+#     --batch-poll-seconds 300 \
+#     --log-level INFO \
+#     > odrl_gold_sharded.log 2>&1 &
+#
+#   echo $! > odrl_gold_sharded.pid
+
+
+
+# ------------The workflow is now separated into two explicit stages------------
+# ### Stage 1: Complete eight primary shards
+#
+#   Use this command instead of --batch-shard-run:
+#
+#   MANIFEST="data/batch_jobs/odrl_gpt-5.6-luna_20260829T144210Z_67a01c9c/manifest.json"
+#
+#   nohup .venv/bin/python -u \
+#     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+#     --batch-shard-primary-run "$MANIFEST" \
+#     --batch-poll-seconds 300 \
+#     --log-level INFO \
+#     > odrl_primary_shards.log 2>&1 &
+#
+#   echo $! > odrl_primary_shards.pid
+#
+#   Monitor it:
+#
+#   tail -f odrl_primary_shards.log
+#
+#   This stage:
+#
+#   - Completes all eight primary shards.
+#   - Accepts valid records.
+#   - Collects invalid records.
+#   - Prepares recovery JSONL locally.
+#   - Does not submit or charge for a recovery Batch.
+#
+#   ### Inspect recovery candidates
+#
+#   After Stage 1 finishes:
+#
+#   RECOVERY_MANIFEST="$(jq -r '.recovery_manifest_path // empty' "$MANIFEST")"
+#
+#   echo "$RECOVERY_MANIFEST"
+#
+#   jq '{status,request_count,requests_path,states_path}' \
+#     "$RECOVERY_MANIFEST"
+#
+#   Count exception records:
+#
+#   RECOVERY_STATES="$(jq -r '.states_path' "$RECOVERY_MANIFEST")"
+#
+#   wc -l "$RECOVERY_STATES"
+#
+#   Inspect the first exceptions:
+#
+#   head -n 5 "$RECOVERY_STATES" | jq .
+#
+#   The recovery Batch has not been submitted when:
+#
+#   {
+#     "status": "prepared"
+#   }
+#
+#   and the recovery manifest has no batch_id.
+#
+#   ### Stage 2: Submit the recovery Batch
+#
+#   When you are satisfied with the exception count:
+#
+#   nohup env \
+#     ODRL_CORRECTION_BATCH_RECOVERY_REASONING_EFFORT=medium \
+#     ODRL_CORRECTION_BATCH_RECOVERY_MAX_OUTPUT_TOKENS=16000 \
+#     ODRL_CORRECTION_FINAL_SYNC_LIMIT=0 \
+#     .venv/bin/python -u \
+#     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph \
+#     --batch-recovery-run "$MANIFEST" \
+#     --batch-poll-seconds 300 \
+#     --log-level INFO \
+#     > odrl_recovery_batch.log 2>&1 &
+#
+#   echo $! > odrl_recovery_batch.pid
+#
+#   Monitor it:
+#
+#   tail -f odrl_recovery_batch.log
+#
+#   After recovery:
+#
+#   - Valid recovery results replace provisional originals.
+#   - Failed recovery results retain their original labels.
+#   - Unresolved records are written to each shard’s manual_review.jsonl.
+#   - Final train, valid, test, ODRL, and diff files are merged.
+#
+#   The previous --batch-shard-run command remains available, but it runs both stages
+#   automatically without pausing.
+
+# 29/8/2026:
+# command history:
+#   MANIFEST="data/batch_jobs/odrl_gpt-5.6-luna_20260829T144210Z_67a01c9c/manifest.json"
+
+#   using gpt correct   nohup .venv/bin/python -u     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph     --batch-shard-primary-run "$MANIFEST"     --batch-poll-seconds 300     --log-level INFO     > odrl_primary_shards.log 2>&1 &
+#      echo $! > odrl_primary_shards.pid
+#    tail odrl_primary_shards.log -f
+#    RECOVERY_MANIFEST="$(jq -r '.recovery_manifest_path // empty' "$MANIFEST")"
+#    echo "$RECOVERY_MANIFEST"
+#    jq '{status,request_count,requests_path,states_path}'     "$RECOVERY_MANIFEST"
+#    RECOVERY_STATES="$(jq -r '.states_path' "$RECOVERY_MANIFEST")"
+#    wc -l "$RECOVERY_STATES"
+#    head -n 5 "$RECOVERY_STATES" | jq .
+#    jq -r '[.custom_id, .validation_error] | @tsv'     "$RECOVERY_STATES"     | less
+
+##    recovery:   nohup env     ODRL_CORRECTION_BATCH_RECOVERY_REASONING_EFFORT=medium     ODRL_CORRECTION_BATCH_RECOVERY_MAX_OUTPUT_TOKENS=16000     ODRL_CORRECTION_FINAL_SYNC_LIMIT=0     .venv/bin/python -u     -m odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph     --batch-recovery-run "$MANIFEST"     --batch-poll-seconds 300     --log-level INFO     > odrl_recovery_batch.log 2>&1 &
+#      echo $! > odrl_recovery_batch.pid
+#    tail odrl_recovery_batch.log -f

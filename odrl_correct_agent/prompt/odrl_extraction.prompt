@@ -29,6 +29,13 @@ Requirements:
   Processor" is annotated as ASSET. attributed_party is another relevant party.
 - constraint states when/where/how/under what condition. purpose states why.
 - Use "" when a component is absent. Avoid punctuation and unrelated context.
+- The final NER is a flat BIO sequence: after identical reused quotes are
+  deduplicated, no two component spans may overlap. Keep every component
+  atomic. In particular, ACTION must exclude its ASSET; CONSTRAINT and PURPOSE
+  must contain only their modifier words and must exclude any ASSIGNEE, ACTION,
+  ASSET, rule marker, or each other. Never solve an overlap by dropping a real
+  component; shorten the overly broad component to its smallest meaningful
+  exact quote.
 - Shared assignee/asset may be reused across coordinated rules only when the
   same exact source quote clearly applies.
 - Preserve source order. IDs and provenance are added by code; do not output them.
@@ -51,6 +58,13 @@ The example demonstrates two important rules: split coordinated permission and
 prohibition clauses, and keep every quoted value grounded in SOURCE. In the
 actual answer, do not include the explanatory text or code fence.
 
+Flat-NER boundary example:
+SOURCE: "The Processor shall use personal data only for fraud prevention."
+Correct components are assignee="The Processor", action="use", asset="personal
+data", purpose="for fraud prevention". Do not return action="use personal data"
+or purpose="personal data only for fraud prevention", because those broad
+quotes overlap the ASSET.
+
 ORIGINAL NER items use {"s":start,"e":end,"l":label,"v":source_value}.
 
 SOURCE:
@@ -58,6 +72,12 @@ SOURCE:
 
 ORIGINAL NER:
 {{ORIGINAL_ENTITIES}}
+
+OTHER ORIGINAL NER VARIANTS FOR IDENTICAL DUPLICATE TEXT:
+{{DUPLICATE_ORIGINAL_NER_VARIANTS}}
+
+All duplicate occurrences will receive this one gold correction. Treat these
+variants only as competing evidence; SOURCE remains authoritative.
 
 MODEL RULES:
 {{MODEL_RULES}}

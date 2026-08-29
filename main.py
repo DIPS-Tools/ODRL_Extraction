@@ -22,6 +22,26 @@ def main():
     parser.add_argument("--data_path", required=True, default="./data/")
     parser.add_argument("--save_dir", required=True, default="./save_models/")
     parser.add_argument("--word_embedding_model_path", required=True)  # e.g., "/home/.../bert-base-cased"
+    parser.add_argument(
+        "--train_file", "--train_path", dest="train_path",
+        help="Training JSONL filename under --data_path, or an explicit path.",
+    )
+    parser.add_argument(
+        "--valid_file", "--dev_path", dest="dev_path",
+        help="Validation JSONL filename under --data_path, or an explicit path.",
+    )
+    parser.add_argument(
+        "--test_file", "--test_path", dest="test_path",
+        help="Test JSONL filename under --data_path, or an explicit path.",
+    )
+    parser.add_argument(
+        "--data_tag",
+        default="",
+        help=(
+            "Dataset provenance tag appended to checkpoint/result filenames, "
+            "for example correct_data_with_agent_gpt-5.6-luna."
+        ),
+    )
     parser.add_argument("--label_type", choices=["BIO", "BIOES"], default="BIO",
                         help="Tagging scheme to use for labels and metrics.")
     parser.add_argument("--trust_remote_code", action="store_true",
@@ -85,6 +105,10 @@ def main():
     cfg = Config(args)
     cfg.rule_bias_alpha = args.rule_bias_alpha
     cfg.apply_rule_postprocess = not args.no_rule_postprocess
+    print(f"Training data:   {cfg.train_path}")
+    print(f"Validation data: {cfg.dev_path}")
+    print(f"Test data:       {cfg.test_path}")
+    print(f"Checkpoint prefix: {cfg.save_path}")
 
     # Preserve the metadata associated with an existing checkpoint during
     # test-only runs. Training runs create/update the parameter record.
@@ -150,30 +174,100 @@ def main():
 
 if __name__ == "__main__":
 
-    #  python main.py --model bert-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-cased  --do_train --do_test  --num_epochs 3
-    #  python main.py --model deberta-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/deberta-base  --do_train --do_test  --num_epochs 3
-
-    # nohup python main.py --model bert-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-cased  --do_train --do_test  --num_epochs 3  > main.log  2>&1 &
-
-    # Test the trained Contract-BERT checkpoint with rule-biased decoding and post-rules:
-    # python main.py --model contract-bert-lstm-crf --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts --num_epochs 20 --batch_size 16 --max_length 400 --learning_rate 5e-5 --label_type BIO --rnn_layers 1 --device cpu --do_test --prediction_strategy rule_bias --rule_bias_alpha 3.0
-
 
     main()
 
-# one model:
-# BERT + LSTM + CRF
-# BERT is used to embeddings each token
-# LSTM + CRF sequence labeling
+#     train:
+# nohup python -u main.py  \
+#   --model contract-bert-lstm-crf  \
+#   --data_path ./data/   \
+#   --train_file train_correct_with_agent_gpt-5.6-luna.txt  \
+#   --valid_file valid_correct_with_agent_gpt-5.6-luna.txt   \
+#   --test_file test_correct_with_agent_gpt-5.6-luna.txt  \
+#   --data_tag correct_data_with_agent_gpt-5.6-luna-v2  \
+#   --save_dir ./save_model  \
+#   --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts  \
+#   --num_epochs 20  \
+#   --batch_size 16  \
+#   --max_length 400 \
+#   --learning_rate 5e-5  \
+#   --label_type BIO  \
+#   --rnn_layers 1  \
+#   --device cuda  \
+#   --do_train \
+#   --do_test > main_contract_bert_epoches20_rnnlays1_mq400_adv_BIO_bs16_with_correct_datasetgpt5.6-v2.log 2>&1 &
 
-# Could be adding rule-based model, create a ACTREE to identify ODRL Entity
 
- # For English NER, transformer encoders fine‑tuned on tagging datasets tend to dominate. In practice I’d shortlist:
- #
- #  - deberta-v3-large or deberta-v3-base: strong contextual representations, great out of the box for NER with modest compute.
- #  - roberta-large or bert-large-cased: still very competitive, tons of community recipes and checkpoints.
- #  - xlm-roberta-large: multilingual if you need cross-language coverage.
- #  - modernBERT-base (or “Longformer”-style models) when sentences get very long; they handle context that vanilla BERT truncates.
- #  - Instruction-tuned encoder-decoders (FLAN-T5 large/xxl) can be repurposed, but they’re heavier. Decoder-only LLMs (Llama/Mistral) work via the new wrapper, yet they usually need more finetuning
- #    effort to match the dedicated encoders.
- #
+
+# using legal-bert-base-uncased
+
+
+# nohup python -u main.py  \
+#   --model legal-bert-base-uncased-lstm-crf  \
+#   --data_path ./data/   \
+#   --train_file train_correct_with_agent_gpt-5.6-luna.txt  \
+#   --valid_file valid_correct_with_agent_gpt-5.6-luna.txt   \
+#   --test_file test_correct_with_agent_gpt-5.6-luna.txt  \
+#   --data_tag correct_data_with_agent_gpt-5.6-luna  \
+#   --save_dir ./save_model  \
+#   --word_embedding_model_path /home/mh1f25/scratch/llms_model/legal-bert-base-uncased  \
+#   --num_epochs 20  \
+#   --batch_size 16  \
+#   --max_length 400 \
+#   --learning_rate 5e-5  \
+#   --label_type BIO  \
+#   --rnn_layers 1  \
+#   --device cuda  \
+#   --do_train \
+#   --do_test > main_legal-bert-base-uncased_epoches20_rnnlays1_mq400_adv_BIO_bs16_with_correct_datasetgpt5.6.log 2>&1 &
+#
+
+
+
+
+# ### Run the tagged model API
+#
+#   nohup .venv/bin/python -u app_rule_bias.py \
+#     --model contract-bert-lstm-crf \
+#     --data_path ./data/ \
+#     --save_dir ./save_model \
+#     --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts
+#     \
+#     --num_epochs 20 \
+#     --batch_size 16 \
+#     --max_length 400 \
+#     --learning_rate 5e-5 \
+#     --label_type BIO \
+#     --rnn_layers 1 \
+#     --rule_bias_alpha 3.0 \
+#     --correct_data_model correct_data_with_agent_gpt-5.6-luna-v2 \
+#     --device cpu \
+#     --do_test \
+#     --host 0.0.0.0 \
+#     --port 5001 \
+#     > fastapi_rule_bias_correct_data_gpt-5.6-luna.log 2>&1 &
+
+# new dataset:
+# nohup python -u main.py \
+# --model contract-bert-lstm-crf \
+# --data_path ./data/ \
+# --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
+# --valid_file valid_correct_with_agent_gpt-5.6-luna_flat.txt \
+# --test_file test_correct_with_agent_gpt-5.6-luna_flat.txt \
+# --data_tag correct_data_with_agent_gpt-5.6-luna-v2 \
+# --save_dir ./save_model \
+# --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts \
+# --num_epochs 20 \
+# --batch_size 16 \
+# --max_length 400 \
+# --learning_rate 5e-5 \
+# --label_type BIO \
+# --rnn_layers 1 \
+# --device cuda \
+# --do_train \
+# --do_test \
+# > main_contract_bert_correct_data_with_agent_gpt-5.6-luna-v2.log 2>&1 &
+#
+# echo $! > main_contract_bert_correct_data_with_agent_gpt-5.6-luna-v2.pid
+
+

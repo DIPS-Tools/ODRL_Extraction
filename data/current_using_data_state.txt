@@ -1,0 +1,37 @@
+The overlap problem is solved without deleting any records and without another OpenAI API
+  call.
+
+  A few overlaps are not directly usable by a flat BIO model because each token can have
+  only one label. Instead, I created explicit non-overlapping training variants.
+
+  Results:
+
+                      Records   Changed records   Removed conflicts   Remaining overlaps
+  Train                 3,867                74                 102                    0
+  Validation              483                 7                   7                    0
+  Test                    484                12                  16                    0
+
+  The priority used for conflicting spans is:
+
+  RULE_TYPE > ACTION > ASSIGNEE > ASSET > CONSTRAINT > PURPOSE
+
+  This preserves core policy labels when a broad PURPOSE or CONSTRAINT contains an action,
+  asset, or rule marker.
+
+  Use these new files:
+
+  data/train_correct_with_agent_gpt-5.6-luna_flat.txt
+  data/valid_correct_with_agent_gpt-5.6-luna_flat.txt
+  data/test_correct_with_agent_gpt-5.6-luna_flat.txt
+
+  Every conflict is documented in:
+
+  data/train_correct_with_agent_gpt-5.6-luna_flat_overlap_audit.jsonl
+  data/valid_correct_with_agent_gpt-5.6-luna_flat_overlap_audit.jsonl
+  data/test_correct_with_agent_gpt-5.6-luna_flat_overlap_audit.jsonl
+
+  The original corrected files remain unchanged as audit datasets. A backup was also saved
+  under:
+
+  data/pre_flat_refinalize_backup_20260829/
+

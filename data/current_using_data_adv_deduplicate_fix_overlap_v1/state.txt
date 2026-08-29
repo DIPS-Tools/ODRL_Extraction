@@ -1,0 +1,16 @@
+Finalized 4834 source record(s) after recovery.
+Recovery candidates: 514
+NER dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/train_correct_with_agent_gpt-5.6-luna.txt
+NER dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/valid_correct_with_agent_gpt-5.6-luna.txt
+NER dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/test_correct_with_agent_gpt-5.6-luna.txt
+Text-to-ODRL dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/train_odrl_with_agent_gpt-5.6-luna.txt
+Text-to-ODRL dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/valid_odrl_with_agent_gpt-5.6-luna.txt
+Text-to-ODRL dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/test_odrl_with_agent_gpt-5.6-luna.txt
+Correction diff dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/train_diffs_from_correct_gpt-5.6-luna.txt
+Correction diff dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/valid_diffs_from_correct_gpt-5.6-luna.txt
+Correction diff dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/test_diffs_from_correct_gpt-5.6-luna.txt
+ODRL correction diff dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/train_odrl_diffs_from_correct_gpt-5.6-luna.txt
+ODRL correction diff dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/valid_odrl_diffs_from_correct_gpt-5.6-luna.txt
+ODRL correction diff dataset: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/test_odrl_diffs_from_correct_gpt-5.6-luna.txt
+Parent manifest: /local/scratch/mh1f25/datapack_pro/datapack-local-dev/odrl_extraction/data/batch_jobs/odrl_gpt-5.6-luna_20260829T144210Z_67a01c9c/manifest.json
+

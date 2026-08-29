@@ -87,11 +87,12 @@ def run_test(
     row_per_type_df = entity_metric_fn(gold_label, pred_label)
     row_per_tag_df = compute_token_metrics_by_tag(gold_label, pred_label, base_labels)
 
-    row_per_type_df.to_csv(cfg.save_path + "_ROW_metrics_per_type.txt", index=True, sep=',', mode='a')
-    row_per_tag_df.to_csv(cfg.save_path + "_ROW_metrics_per_tag.txt", index=True, sep=',', mode='a')
-
     print(row_per_type_df)
     print(row_per_tag_df)
+
+    # Overwrite evaluation artifacts on each run so stale headers/tables do not accumulate.
+    row_per_type_df.to_csv(cfg.save_path + "_ROW_metrics_per_type.txt", index=True, sep=',', mode='w')
+    row_per_tag_df.to_csv(cfg.save_path + "_ROW_metrics_per_tag.txt", index=True, sep=',', mode='w')
 
     #
     # # ---- Heuristic post-processing (BIOES only) ----
@@ -118,22 +119,6 @@ def run_test(
     #
     #     pred_label = refined_pred_label
     #
-    # # # using hybrid rules only
-    # # if test_features is not None:
-    # #     pred_label = apply_rules_to_predictions(pred_label, test_features)
-    #
-    # # per_type_df = compute_entity_metrics_by_type(gold_label, pred_label)  # ASSET/ACTION/...
-
-    per_type_df = entity_metric_fn(gold_label, pred_label)
-    per_tag_df = compute_token_metrics_by_tag(gold_label, pred_label, base_labels)
-
-    print(per_type_df)
-    print(per_tag_df)
-
-    # optionally save
-    per_type_df.to_csv(cfg.save_path + "_heuristic_postprocess_metrics_per_type.txt", index=True, sep=',', mode='a')
-    per_tag_df.to_csv(cfg.save_path + "_heuristic_postprocess_metrics_per_tag.txt", index=True, sep=',', mode='a')
-
     # Metrics (per selected label scheme)
     acc, p, r, f = get_ner_fmeasure(gold_label, pred_label, label_type=cfg.label_type)
     metrics_df = pd.DataFrame([{

@@ -128,6 +128,7 @@ def render_correction_prompt(
     source_text: str,
     original_entities: list[dict[str, Any]],
     endpoint_rules: list[dict[str, str]],
+    duplicate_original_variants: list[list[dict[str, Any]]] | None = None,
 ) -> str:
     """Fill the prompt using explicit markers that do not conflict with JSON."""
     # Compact evidence matters for large datasets: the prompt is sent once per
@@ -153,6 +154,18 @@ def render_correction_prompt(
         if compact_rule.get("source_text") == source_text:
             compact_rule.pop("source_text", None)
         compact_model_rules.append(compact_rule)
+    duplicate_variants_with_quotes = [
+        [
+            {
+                "s": entity["start"],
+                "e": entity["end"],
+                "l": entity["label"],
+                "v": source_text[entity["start"]:entity["end"]],
+            }
+            for entity in variant
+        ]
+        for variant in (duplicate_original_variants or [])
+    ]
     replacements = {
         "{{SOURCE_TEXT}}": source_text,
         "{{ORIGINAL_ENTITIES}}": json.dumps(
@@ -162,6 +175,11 @@ def render_correction_prompt(
         ),
         "{{MODEL_RULES}}": json.dumps(
             compact_model_rules,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "{{DUPLICATE_ORIGINAL_NER_VARIANTS}}": json.dumps(
+            duplicate_variants_with_quotes,
             ensure_ascii=False,
             separators=(",", ":"),
         ),
@@ -212,7 +230,44 @@ def build_chat_completion_request(prompt: str, model_name: str) -> dict[str, Any
     ).strip()
     if max_output_tokens:
         request["max_completion_tokens"] = int(max_output_tokens)
-    if os.getenv("ODRL_CORRECTION_JSON_MODE", "true").lower() == "true":
+    if os.getenv("ODRL_CORRECTION_STRUCTURED_OUTPUT", "true").lower() == "true":
+        rule_properties = {
+            name: {"type": "string"}
+            for name in (
+                "source_text",
+                "assignee",
+                "action",
+                "asset",
+                "attributed_party",
+                "rule_type",
+                "constraint",
+                "purpose",
+            )
+        }
+        request["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "odrl_correction",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "validated_policy_rules": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": rule_properties,
+                                "required": list(rule_properties),
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["validated_policy_rules"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    elif os.getenv("ODRL_CORRECTION_JSON_MODE", "true").lower() == "true":
         request["response_format"] = {"type": "json_object"}
     return request
 
@@ -221,7 +276,14 @@ def _quote_pattern(quote: str) -> re.Pattern[str] | None:
     parts = quote.strip().split()
     if not parts:
         return None
-    return re.compile(r"\s+".join(re.escape(part) for part in parts), re.IGNORECASE)
+    body = r"\s+".join(re.escape(part) for part in parts)
+    # AI output is required to preserve source case. Word guards also prevent
+    # an ACTION such as "provide" from matching the prefix of "Providers".
+    if parts[0][0].isalnum() or parts[0][0] == "_":
+        body = r"(?<!\w)" + body
+    if parts[-1][-1].isalnum() or parts[-1][-1] == "_":
+        body += r"(?!\w)"
+    return re.compile(body)
 
 
 def _find_quote_spans(
@@ -278,7 +340,8 @@ def rules_to_entities(
     """Ground corrected component strings back to exact character offsets."""
     entities: list[dict[str, Any]] = []
     warnings: list[str] = []
-    used_rule_type_spans: set[tuple[int, int]] = set()
+    reusable_component_spans: dict[tuple[str, str], tuple[int, int]] = {}
+    reusable_rule_type_spans: dict[str, tuple[int, int]] = {}
 
     for rule_index, rule in enumerate(rules, start=1):
         scope = _source_scope(source_text, rule.get("source_text", ""))
@@ -293,10 +356,28 @@ def rules_to_entities(
             quote = rule.get(field, "")
             if not quote:
                 continue
+            reusable_key = (label, quote)
             span = _pick_span(
                 _find_quote_spans(source_text, quote, scope),
                 action_anchor,
             )
+            # A coordinated rule's smallest source_text may omit a shared
+            # assignee or asset that was already grounded by an earlier rule.
+            # Reuse only an identical, same-label quote; the final entity list
+            # deduplicates the physical span for flat BIO output.
+            if (
+                span is None
+                and field in {"assignee", "asset"}
+                and reusable_key in reusable_component_spans
+            ):
+                span = reusable_component_spans[reusable_key]
+            if span is None:
+                # Models occasionally make source_text too narrow while still
+                # returning a valid exact component quote. A unique full-source
+                # match is unambiguous and safer than another model call.
+                global_candidates = _find_quote_spans(source_text, quote)
+                if len(global_candidates) == 1:
+                    span = global_candidates[0]
             if span is None:
                 # A valid component must be a source quote. Do not invent an
                 # approximate offset that would corrupt the training data.
@@ -305,6 +386,8 @@ def rules_to_entities(
                 )
                 continue
             entities.append({"start": span[0], "end": span[1], "label": label})
+            if field in {"assignee", "asset"}:
+                reusable_component_spans.setdefault(reusable_key, span)
 
         rule_type = rule.get("rule_type", "")
         if not rule_type:
@@ -315,23 +398,31 @@ def rules_to_entities(
             candidates = [
                 (scope[0] + match.start(), scope[0] + match.end())
                 for match in pattern.finditer(source_text[scope[0]:scope[1]])
-                if (scope[0] + match.start(), scope[0] + match.end())
-                not in used_rule_type_spans
             ]
         if not candidates:
             candidates = [
                 span
                 for span in _original_rule_type_candidates(original_entities, rule_type)
                 if scope[0] <= span[0] < span[1] <= scope[1]
-                and span not in used_rule_type_spans
             ]
+        if not candidates and rule_type in reusable_rule_type_spans:
+            candidates = [reusable_rule_type_spans[rule_type]]
+        if not candidates and pattern is not None:
+            # A coordinated clause can inherit its modal from earlier text.
+            # Select the nearest explicit full-source marker to the action; the
+            # final flat entity set will deduplicate a shared marker.
+            candidates = [
+                (match.start(), match.end()) for match in pattern.finditer(source_text)
+            ]
+        if not candidates:
+            candidates = _original_rule_type_candidates(original_entities, rule_type)
         span = _pick_span(candidates, action_anchor)
         if span is None:
             warnings.append(
                 f"rule {rule_index}: cannot locate the {rule_type} marker in source text"
             )
             continue
-        used_rule_type_spans.add(span)
+        reusable_rule_type_spans.setdefault(rule_type, span)
         entities.append({
             "start": span[0],
             "end": span[1],
@@ -414,6 +505,7 @@ async def node_odrl_correct(state: ODRLCorrectionState) -> dict[str, Any]:
         source_text,
         original_entities,
         endpoint_rules,
+        list(state.get("duplicate_original_variants") or []),
     )
 
     warnings = list(state.get("correction_warnings") or [])
@@ -473,4 +565,5 @@ async def node_odrl_correct(state: ODRLCorrectionState) -> dict[str, Any]:
             corrected_entities,
         ),
         "correction_warnings": warnings,
+        "grounding_warnings": grounding_warnings,
     }

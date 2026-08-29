@@ -1,5 +1,6 @@
 # config.py
 import os
+import re
 import torch
 from transformers import AutoTokenizer, AutoConfig
 
@@ -8,6 +9,28 @@ from model.bert_idcnn_crf import BERT_IDCNN_CRF
 from model.bert_lstm_crf import BERT_LSTM_CRF
 from model.deberta_crf import DeBERTa_CRF
 from model.hf_lstm_crf import HF_LSTM_CRF
+
+
+def resolve_dataset_path(data_path, supplied_path, default_filename):
+    """Resolve a dataset filename relative to data_path, or preserve a path."""
+    value = str(supplied_path or "").strip()
+    if not value:
+        return os.path.join(data_path, default_filename)
+    expanded = os.path.expanduser(value)
+    if os.path.isabs(expanded) or os.path.dirname(expanded):
+        return expanded
+    return os.path.join(data_path, expanded)
+
+
+def safe_checkpoint_tag(value):
+    """Create a path-safe, readable tag for checkpoint provenance."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    tag = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-")
+    if not tag:
+        raise ValueError("The checkpoint data tag contains no usable characters.")
+    return tag
 
 
 class Config(object):
@@ -22,9 +45,29 @@ class Config(object):
 
         # Data
         self.data_path = args.data_path
-        self.train_path = getattr(args, "train_path", os.path.join(self.data_path, "train.txt"))
-        self.dev_path   = getattr(args, "dev_path",   os.path.join(self.data_path, "dev.txt"))
-        self.test_path  = getattr(args, "test_path",  os.path.join(self.data_path, "test.txt"))
+        self.train_path = resolve_dataset_path(
+            self.data_path, getattr(args, "train_path", None), "train.txt"
+        )
+        # get_data() retains its existing dev.txt -> valid.txt compatibility
+        # when no explicit validation file is supplied.
+        self.dev_path = resolve_dataset_path(
+            self.data_path, getattr(args, "dev_path", None), "dev.txt"
+        )
+        self.test_path = resolve_dataset_path(
+            self.data_path, getattr(args, "test_path", None), "test.txt"
+        )
+        training_data_tag = getattr(args, "data_tag", "")
+        inference_data_tag = getattr(args, "correct_data_model", "")
+        if training_data_tag and inference_data_tag:
+            left = safe_checkpoint_tag(training_data_tag)
+            right = safe_checkpoint_tag(inference_data_tag)
+            if left != right:
+                raise ValueError(
+                    "--data_tag and --correct_data_model identify different checkpoints."
+                )
+        self.data_tag = safe_checkpoint_tag(
+            inference_data_tag or training_data_tag
+        )
 
         # Saving
         self.save_dir   = args.save_dir
@@ -188,6 +231,8 @@ class Config(object):
             suffix += f"_num_layers{self.rnn_layers}"
         else:
             suffix += f"_num_layers{self.rnn_layers}"
+        if self.data_tag:
+            suffix += f"_{self.data_tag}"
         self.save_path = os.path.join(self.save_dir, suffix)
 
 

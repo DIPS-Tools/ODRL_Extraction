@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -11,6 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from odrl_correct_agent.odrl_correct_process.agent.batch_processing import (
+    _recover_invalid_flat_ner,
+    _validate_recovery_alignment,
     finalize_batch_job,
     prepare_batch_job,
     refresh_batch_status,
@@ -21,10 +24,15 @@ from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_correct impor
     render_correction_prompt,
     rules_to_entities,
 )
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_flat_ner_validate import (
+    validate_flat_ner_entities,
+)
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_output import (
     build_diff_record,
 )
 from odrl_correct_agent.odrl_correct_process.agent.sharded_batch import (
+    run_primary_sharded_batch_job,
+    run_recovery_batch_job,
     run_sharded_batch_job,
 )
 from odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph import (
@@ -40,6 +48,7 @@ from odrl_correct_agent.odrl_correct_process.agent.odrl_correct_main_graph impor
     odrl_output_path,
 )
 from odrl_correct_agent.utils.draw_mermaid_png import draw_mermaid_png
+from data.build_trainable_flat_datasets import flatten_entities
 
 
 class _FakeFileContent:
@@ -51,9 +60,10 @@ class _FakeFileContent:
 
 
 class _FakeFiles:
-    def __init__(self, truncated: bool = False):
+    def __init__(self, truncated: bool = False, payload: dict | None = None):
         self.requests: list[dict] = []
         self.truncated = truncated
+        self.payload = payload or DEMO_AI_RESPONSE
 
     def create(self, *, file, purpose: str):
         self.requests = [
@@ -78,7 +88,7 @@ class _FakeFiles:
                     "body": {
                         "choices": [{
                             "message": {
-                                "content": json.dumps(DEMO_AI_RESPONSE),
+                                "content": json.dumps(self.payload),
                             },
                             "finish_reason": "length" if self.truncated else "stop",
                         }],
@@ -119,14 +129,38 @@ class _FakeBatches:
         )
 
 
+class _FakeRecoveryCompletions:
+    def __init__(self):
+        self.requests: list[dict] = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(DEMO_AI_RESPONSE)),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(
+                prompt_tokens=120,
+                completion_tokens=80,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=20),
+                total_tokens=200,
+            ),
+        )
+
+
 class _FakeOpenAIClient:
     def __init__(
         self,
         truncated: bool = False,
         statuses: list[object] | None = None,
+        recover: bool = False,
+        payload: dict | None = None,
     ):
-        self.files = _FakeFiles(truncated=truncated)
+        self.files = _FakeFiles(truncated=truncated, payload=payload)
         self.batches = _FakeBatches(statuses=statuses)
+        if recover:
+            self.chat = SimpleNamespace(completions=_FakeRecoveryCompletions())
 
 
 class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -169,7 +203,9 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["batch_id"], "batch-test")
-            self.assertEqual(manifest["request_count"], 3)
+            self.assertEqual(manifest["request_count"], 1)
+            self.assertEqual(manifest["source_record_count"], 3)
+            self.assertEqual(manifest["duplicate_occurrence_count"], 2)
             request_body = fake_client.files.requests[0]["body"]
             self.assertEqual(request_body["reasoning_effort"], "medium")
             self.assertEqual(request_body["max_completion_tokens"], 2000)
@@ -192,8 +228,21 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(path.is_file() for path in ner_paths + odrl_paths))
             finalized = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(finalized["status"], "finalized")
-            self.assertEqual(finalized["usage"]["total_tokens"], 450)
+            self.assertEqual(finalized["usage"]["total_tokens"], 150)
             self.assertEqual(finalized["fallback_count"], 0)
+            self.assertTrue(finalized["duplicate_gold_verified"])
+            self.assertEqual(finalized["expanded_record_count"], 3)
+            self.assertEqual(
+                finalized["flat_ner_validation"]["remaining_overlap_count"], 0
+            )
+            output_records = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in ner_paths
+            ]
+            self.assertEqual(
+                [record["entities"] for record in output_records],
+                [output_records[0]["entities"]] * 3,
+            )
             self.assertEqual(
                 [Path(path).name for path in finalized["diff_outputs"]],
                 [
@@ -233,6 +282,47 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "truncated"):
                 await finalize_batch_job(manifest_path, client=fake_client)
+
+    async def test_batch_finalization_recovers_only_truncated_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "test.txt"
+            source.write_text(json.dumps(DEMO_INPUT) + "\n", encoding="utf-8")
+            fake_client = _FakeOpenAIClient(truncated=True, recover=True)
+            manifest_path = await prepare_batch_job(
+                [source],
+                output_dir=root,
+                model_name="gpt-5.6-luna",
+                call_endpoint=False,
+                submit=True,
+                client=fake_client,
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ODRL_CORRECTION_RECOVER_FAILED_BATCH": "true",
+                    "ODRL_CORRECTION_RECOVERY_ATTEMPTS": "2",
+                    "ODRL_CORRECTION_RECOVERY_REASONING_EFFORT": "low",
+                    "ODRL_CORRECTION_RECOVERY_MAX_OUTPUT_TOKENS": "16000",
+                },
+            ):
+                _, _, states = await finalize_batch_job(
+                    manifest_path,
+                    client=fake_client,
+                )
+
+            self.assertEqual(len(states), 1)
+            self.assertEqual(states[0]["selected_from"], "ai_reconciliation")
+            self.assertEqual(len(fake_client.chat.completions.requests), 1)
+            retry_request = fake_client.chat.completions.requests[0]
+            self.assertEqual(retry_request["reasoning_effort"], "low")
+            self.assertEqual(retry_request["max_completion_tokens"], 16000)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["recovery_count"], 1)
+            self.assertEqual(manifest["recovery_attempt_count"], 1)
+            self.assertEqual(manifest["recovered_custom_ids"], ["test-0000001"])
+            # Includes both the unusable Batch call and the standard recovery.
+            self.assertEqual(manifest["usage"]["total_tokens"], 350)
 
     async def test_batch_watcher_polls_then_strictly_finalizes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -320,13 +410,13 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             )
             finalized = await run_sharded_batch_job(
                 parent_path,
-                maximum_prompt_tokens=2000,
+                maximum_prompt_tokens=4000,
                 poll_interval_seconds=1,
                 client=fake_client,
             )
             self.assertEqual(finalized["status"], "finalized")
-            self.assertEqual(finalized["shard_count"], 3)
-            self.assertEqual(finalized["completed_shards"], 3)
+            self.assertEqual(finalized["shard_count"], 1)
+            self.assertEqual(finalized["completed_shards"], 1)
             for key in (
                 "ner_outputs",
                 "odrl_outputs",
@@ -342,6 +432,50 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     if line.strip()
                 ]
                 self.assertEqual(len(records), 1)
+
+    async def test_sharded_batch_defers_invalid_records_to_one_recovery_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_three_splits(root)
+            invalid = {
+                "validated_policy_rules": [{
+                    **DEMO_AI_RESPONSE["validated_policy_rules"][0],
+                    "assignee": DEMO_INPUT["text"],
+                }]
+            }
+            fake_client = _FakeOpenAIClient(payload=invalid)
+            parent_path = await prepare_batch_job(
+                [root / "train.txt", root / "valid.txt", root / "test.txt"],
+                output_dir=root,
+                model_name="test-model",
+                call_endpoint=False,
+                submit=False,
+            )
+            with patch.dict(os.environ, {"ODRL_CORRECTION_FINAL_SYNC_LIMIT": "0"}):
+                primary = await run_primary_sharded_batch_job(
+                    parent_path,
+                    maximum_prompt_tokens=4000,
+                    poll_interval_seconds=0.001,
+                    client=fake_client,
+                )
+            recovery_manifest = Path(primary["recovery_manifest_path"])
+            recovery = json.loads(recovery_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(recovery["request_count"], 1)
+            self.assertEqual(recovery["status"], "prepared")
+            self.assertNotIn("batch_id", recovery)
+            with patch.dict(os.environ, {"ODRL_CORRECTION_FINAL_SYNC_LIMIT": "0"}):
+                finalized = await run_recovery_batch_job(
+                    parent_path,
+                    poll_interval_seconds=0.001,
+                    client=fake_client,
+                )
+            recovery = json.loads(recovery_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(recovery["status"], "distributed")
+            shard_manifest = Path(finalized["shard_manifests"][0])
+            shard = json.loads(shard_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(shard["status"], "finalized")
+            self.assertEqual(shard["manual_review_count"], 1)
+            self.assertTrue(Path(shard["manual_review_path"]).is_file())
 
     async def test_batch_watcher_stops_on_expired_remote_job(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -469,6 +603,7 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 "node_initialize",
                 "node_odrl_extraction",
                 "node_odrl_correct",
+                "node_flat_ner_validate",
                 "node_odrl_output",
                 "__end__",
             ),
@@ -623,6 +758,182 @@ class ODRLCorrectionWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class GroundingTests(unittest.TestCase):
+    def test_recovery_cannot_reuse_one_action_for_separate_clauses(self) -> None:
+        text = "Processor shall ensure security and ensure accuracy."
+        rules = [
+            {
+                "source_text": "Processor shall ensure security",
+                "assignee": "Processor",
+                "action": "ensure",
+                "asset": "security",
+                "rule_type": "obligation",
+            },
+            {
+                "source_text": "ensure accuracy",
+                "assignee": "Processor",
+                "action": "ensure",
+                "asset": "accuracy",
+                "rule_type": "obligation",
+            },
+        ]
+        entities = [
+            {"start": 0, "end": 9, "label": "ASSIGNEE"},
+            {"start": 10, "end": 15, "label": "RULE_TYPE-OBLIGATION"},
+            {"start": 16, "end": 22, "label": "ACTION"},
+            {"start": 23, "end": 31, "label": "ASSET"},
+            {"start": 43, "end": 51, "label": "ASSET"},
+        ]
+        with self.assertRaisesRegex(ValueError, "inside its source_text"):
+            _validate_recovery_alignment(text, rules, entities)
+
+    def test_flat_ner_recovery_uses_direct_validated_offsets(self) -> None:
+        text = "The Processor shall use data."
+        payload = {
+            "validated_policy_rules": [{
+                "source_text": text,
+                "assignee": "The Processor",
+                "action": "use",
+                "asset": "data",
+                "attributed_party": "",
+                "rule_type": "obligation",
+                "constraint": "",
+                "purpose": "",
+            }],
+            "corrected_entities": [
+                {"start": 0, "end": 13, "label": "ASSIGNEE", "text": "The Processor"},
+                {"start": 14, "end": 19, "label": "RULE_TYPE-OBLIGATION", "text": "shall"},
+                {"start": 20, "end": 23, "label": "ACTION", "text": "use"},
+                # Deliberately wrong offsets: recovery must ground the exact
+                # returned quote instead of trusting model character counting.
+                {"start": 25, "end": 29, "label": "ASSET", "text": "data"},
+            ],
+        }
+
+        class Completions:
+            request = None
+
+            def create(self, **request):
+                self.request = request
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=json.dumps(payload)),
+                    )],
+                    usage=None,
+                )
+
+        completions = Completions()
+        api = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions),
+        )
+        update, _, warnings, attempts = asyncio.run(_recover_invalid_flat_ner(
+            api,
+            state={"source_text": text, "original_entities": []},
+            prompt="SOURCE: " + text,
+            validation_error="flat BIO annotations cannot overlap",
+            model_name="test-model",
+            custom_id="train-0000001",
+            usage={
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+            },
+        ))
+        self.assertIsNotNone(update)
+        self.assertEqual(attempts, 1)
+        self.assertTrue(warnings)
+        self.assertEqual(len(update["corrected_entities"]), 4)
+        asset = next(
+            entity for entity in update["corrected_entities"]
+            if entity["label"] == "ASSET"
+        )
+        self.assertEqual((asset["start"], asset["end"]), (24, 28))
+        self.assertTrue(any("deterministically corrected" in item for item in warnings))
+        self.assertEqual(
+            completions.request["response_format"]["json_schema"]["name"],
+            "odrl_flat_ner_recovery",
+        )
+
+    def test_flat_ner_recovery_accepts_partial_rule_without_rule_type(self) -> None:
+        text = "The Data Controller consults the Data Processor."
+        asset_start = text.index("Data Processor")
+        payload = {
+            "validated_policy_rules": [{
+                "source_text": text,
+                "assignee": "",
+                "action": "",
+                "asset": "Data Processor",
+                "attributed_party": "",
+                "rule_type": "",
+                "constraint": "",
+                "purpose": "",
+            }],
+            "corrected_entities": [
+                {
+                    "start": asset_start,
+                    "end": asset_start + len("Data Processor"),
+                    "label": "ASSET",
+                    "text": "Data Processor",
+                },
+            ],
+        }
+
+        class Completions:
+            def create(self, **request):
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=json.dumps(payload)),
+                    )],
+                    usage=None,
+                )
+
+        api = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        update, _, _, attempts = asyncio.run(_recover_invalid_flat_ner(
+            api,
+            state={"source_text": text, "original_entities": []},
+            prompt="SOURCE: " + text,
+            validation_error="cannot locate the rule marker",
+            model_name="test-model",
+            custom_id="train-0000002",
+            usage={
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+            },
+            attempts_override=1,
+        ))
+        self.assertEqual(attempts, 1)
+        self.assertIsNotNone(update)
+        self.assertEqual(update["validated_policy_rules"][0]["rule_type"], "")
+        self.assertEqual(
+            {entity["label"] for entity in update["corrected_entities"]},
+            {"ASSET"},
+        )
+
+    def test_flat_ner_validation_rejects_overlapping_components(self) -> None:
+        text = "The Processor shall use personal data for research."
+        with self.assertRaisesRegex(ValueError, "cannot overlap"):
+            validate_flat_ner_entities(text, [
+                {"start": 20, "end": 37, "label": "ACTION"},
+                {"start": 24, "end": 37, "label": "ASSET"},
+            ])
+
+    def test_trainable_flat_policy_keeps_core_entity_over_broad_purpose(self) -> None:
+        text = "to share personal data for research"
+        purpose = {"start": 0, "end": len(text), "label": "PURPOSE"}
+        action_start = text.index("share")
+        action = {
+            "start": action_start,
+            "end": action_start + len("share"),
+            "label": "ACTION",
+        }
+        retained, removed = flatten_entities(text, [purpose, action])
+        self.assertEqual(retained, [action])
+        self.assertEqual(removed[0]["removed_entity"]["label"], "PURPOSE")
+
     def test_prompt_evidence_is_compact_and_does_not_repeat_full_source(self) -> None:
         template = Path(
             "odrl_correct_agent/prompt/odrl_extraction.prompt"
@@ -661,6 +972,81 @@ class GroundingTests(unittest.TestCase):
         )
         self.assertTrue(any("not an exact source quote" in warning for warning in warnings))
         self.assertFalse(any(entity["label"] == "ASSET" for entity in entities))
+
+    def test_action_does_not_match_inside_a_longer_word(self) -> None:
+        text = "The CHIS Hub Service Providers will provide information."
+        rules = [{
+            "source_text": text,
+            "assignee": "The CHIS Hub Service Providers",
+            "action": "provide",
+            "asset": "information",
+            "rule_type": "obligation",
+            "constraint": "",
+            "purpose": "",
+        }]
+        entities, warnings = rules_to_entities(text, rules, [])
+        self.assertFalse(warnings)
+        action = next(entity for entity in entities if entity["label"] == "ACTION")
+        self.assertEqual(text[action["start"]:action["end"]], "provide")
+        self.assertEqual(action["start"], text.index("provide", text.index("will")))
+        validate_flat_ner_entities(text, entities)
+
+    def test_coordinated_rules_reuse_shared_components_and_modal_once(self) -> None:
+        text = "Every individual must uphold principles and seek advice."
+        rules = [
+            {
+                "source_text": "Every individual must uphold principles",
+                "assignee": "Every individual",
+                "action": "uphold",
+                "asset": "principles",
+                "rule_type": "obligation",
+                "constraint": "",
+                "purpose": "",
+            },
+            {
+                "source_text": "must uphold principles and seek advice",
+                "assignee": "Every individual",
+                "action": "seek",
+                "asset": "advice",
+                "rule_type": "obligation",
+                "constraint": "",
+                "purpose": "",
+            },
+        ]
+        entities, warnings = rules_to_entities(text, rules, [])
+        self.assertFalse(warnings)
+        self.assertEqual(
+            sum(entity["label"] == "ASSIGNEE" for entity in entities),
+            1,
+        )
+        self.assertEqual(
+            sum(entity["label"] == "RULE_TYPE-OBLIGATION" for entity in entities),
+            1,
+        )
+        self.assertEqual(
+            sum(entity["label"] == "ACTION" for entity in entities),
+            2,
+        )
+        validate_flat_ner_entities(text, entities)
+
+    def test_unique_component_outside_narrow_rule_source_is_grounded(self) -> None:
+        text = "The Processor shall retain records when required."
+        rules = [{
+            "source_text": "retain records",
+            "assignee": "The Processor",
+            "action": "retain",
+            "asset": "records",
+            "rule_type": "obligation",
+            "constraint": "when required",
+            "purpose": "",
+        }]
+        entities, warnings = rules_to_entities(text, rules, [])
+        self.assertFalse(warnings)
+        self.assertEqual(
+            {entity["label"] for entity in entities},
+            {"ASSIGNEE", "ACTION", "ASSET", "CONSTRAINT", "RULE_TYPE-OBLIGATION"},
+        )
+        validate_flat_ner_entities(text, entities)
 
     def test_endpoint_modal_is_removed_from_action(self) -> None:
         rules = normalize_endpoint_rules(

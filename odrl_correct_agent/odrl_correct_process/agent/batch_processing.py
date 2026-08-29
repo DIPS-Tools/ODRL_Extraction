@@ -21,9 +21,16 @@ from openai import OpenAI
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_initialize import node_initialize
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_correct import (
     build_chat_completion_request,
+    compare_entity_sets,
     node_odrl_correct,
     normalize_endpoint_rules,
+    normalize_rules,
+    parse_ai_response,
     render_correction_prompt,
+)
+from odrl_correct_agent.odrl_correct_process.agent.nodes.node_flat_ner_validate import (
+    node_flat_ner_validate,
+    validate_flat_ner_entities,
 )
 from odrl_correct_agent.odrl_correct_process.agent.nodes.node_odrl_extraction import (
     node_odrl_extraction,
@@ -63,7 +70,36 @@ PERSISTED_STATE_KEYS = (
     "endpoint_rules",
     "endpoint_error",
     "correction_warnings",
+    "duplicate_original_variants",
 )
+
+
+def _entity_signature(record: dict[str, Any]) -> tuple[tuple[int, int, str], ...]:
+    return tuple(sorted(
+        (
+            int(entity["start"]),
+            int(entity["end"]),
+            str(entity["label"]),
+        )
+        for entity in record.get("entities") or []
+    ))
+
+
+def _canonical_occurrence(
+    occurrences: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Choose the most frequent original annotation as AI evidence."""
+    counts: dict[tuple[tuple[int, int, str], ...], int] = {}
+    for occurrence in occurrences:
+        signature = _entity_signature(dict(occurrence["input_record"]))
+        counts[signature] = counts.get(signature, 0) + 1
+    return min(
+        occurrences,
+        key=lambda item: (
+            -counts[_entity_signature(dict(item["input_record"]))],
+            int(item["source_order"]),
+        ),
+    )
 
 
 def _safe_model_name(model_name: str) -> str:
@@ -414,65 +450,139 @@ async def prepare_batch_job(
     request_records: list[dict[str, Any]] = []
     state_records: list[dict[str, Any]] = []
     split_metadata: list[dict[str, Any]] = []
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    source_order = 0
     for source, split in zip(sources, split_names):
         records = _read_jsonl(source)
+        original_odrl_path = source.with_name(f"{source.stem}_odrl.txt")
+        original_odrl_records = (
+            _read_jsonl(original_odrl_path) if original_odrl_path.is_file() else []
+        )
         if limit is not None:
             records = records[:limit]
+            original_odrl_records = original_odrl_records[:limit]
+        if original_odrl_records and len(original_odrl_records) != len(records):
+            raise ValueError(
+                f"{original_odrl_path} has {len(original_odrl_records)} records; "
+                f"expected {len(records)} to align with {source}"
+            )
         split_metadata.append({
             "split": split,
             "source_path": str(source),
             "record_count": len(records),
             "source_sha256": _sha256_file(source),
+            "original_odrl_path": (
+                str(original_odrl_path) if original_odrl_path.is_file() else ""
+            ),
+            "original_odrl_sha256": (
+                _sha256_file(original_odrl_path) if original_odrl_path.is_file() else ""
+            ),
         })
-        logger.info(
-            "batch_prepare split=%s status=started records=%d",
-            split,
-            len(records),
-        )
+        logger.info("batch_prepare split=%s status=grouping records=%d", split, len(records))
         for index, record in enumerate(records, start=1):
-            custom_id = f"{split}-{index:07d}"
-            state = create_correction_state(
-                record,
-                record_index=index,
-                record_total=len(records),
-                dataset_path=str(source),
-                output_dir=str(final_output_dir),
-                prompt_path=str(prompt_snapshot_path),
-                model_name=resolved_model,
-                endpoint=endpoint,
-                call_endpoint=call_endpoint,
-            )
-            await _run_preparation_nodes(state)
-            if call_endpoint and state.get("endpoint_error"):
-                raise RuntimeError(
-                    f"{custom_id}: local ODRL extraction failed; Batch submission "
-                    f"stopped to protect correction quality: {state['endpoint_error']}"
-                )
-            endpoint_rules = normalize_endpoint_rules(
-                state.get("endpoint_rules"),
-                str(state.get("source_text") or ""),
-            )
-            prompt = render_correction_prompt(
-                str(state.get("prompt_template") or ""),
-                str(state.get("source_text") or ""),
-                list(state.get("original_entities") or []),
-                endpoint_rules,
-            )
-            request_records.append({
-                "custom_id": custom_id,
-                "method": "POST",
-                "url": "/v1/chat/completions",
-                "body": build_chat_completion_request(prompt, resolved_model),
+            source_text = str(record.get("text") or "")
+            if not source_text:
+                raise ValueError(f"{source}:{index} has empty text")
+            source_order += 1
+            grouped.setdefault(source_text, []).append({
+                "split": split,
+                "record_index": index,
+                "record_total": len(records),
+                "dataset_path": str(source),
+                "input_record": record,
+                "original_odrl_record": (
+                    original_odrl_records[index - 1]
+                    if original_odrl_records
+                    else None
+                ),
+                "source_order": source_order,
             })
-            state_records.append(_persisted_state(custom_id, split, state))
-            logger.info(
-                "batch_prepare split=%s record=%d/%d custom_id=%s status=prepared",
-                split,
-                index,
-                len(records),
-                custom_id,
+
+    total_occurrences = sum(len(items) for items in grouped.values())
+    duplicate_text_group_count = sum(1 for items in grouped.values() if len(items) > 1)
+    conflicting_original_gold_group_count = sum(
+        1
+        for items in grouped.values()
+        if len({
+            _entity_signature(dict(item["input_record"])) for item in items
+        }) > 1
+    )
+    for unique_index, (source_text, occurrences) in enumerate(grouped.items(), start=1):
+        canonical = _canonical_occurrence(occurrences)
+        split = str(canonical["split"])
+        index = int(canonical["record_index"])
+        custom_id = f"{split}-{index:07d}"
+        canonical_record = dict(canonical["input_record"])
+        signatures_seen: set[tuple[tuple[int, int, str], ...]] = set()
+        duplicate_variants: list[list[dict[str, Any]]] = []
+        canonical_signature = _entity_signature(canonical_record)
+        for occurrence in occurrences:
+            record = dict(occurrence["input_record"])
+            signature = _entity_signature(record)
+            if signature == canonical_signature or signature in signatures_seen:
+                continue
+            signatures_seen.add(signature)
+            duplicate_variants.append([
+                dict(entity) for entity in record.get("entities") or []
+            ])
+        state = create_correction_state(
+            canonical_record,
+            record_index=index,
+            record_total=int(canonical["record_total"]),
+            dataset_path=str(canonical["dataset_path"]),
+            output_dir=str(final_output_dir),
+            prompt_path=str(prompt_snapshot_path),
+            model_name=resolved_model,
+            endpoint=endpoint,
+            call_endpoint=call_endpoint,
+            duplicate_original_variants=duplicate_variants,
+        )
+        await _run_preparation_nodes(state)
+        if call_endpoint and state.get("endpoint_error"):
+            raise RuntimeError(
+                f"{custom_id}: local ODRL extraction failed; Batch submission "
+                f"stopped to protect correction quality: {state['endpoint_error']}"
             )
-        logger.info("batch_prepare split=%s status=completed", split)
+        endpoint_rules = normalize_endpoint_rules(
+            state.get("endpoint_rules"), source_text
+        )
+        prompt = render_correction_prompt(
+            str(state.get("prompt_template") or ""),
+            source_text,
+            list(state.get("original_entities") or []),
+            endpoint_rules,
+            duplicate_variants,
+        )
+        request_records.append({
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": build_chat_completion_request(prompt, resolved_model),
+        })
+        persisted = _persisted_state(custom_id, split, state)
+        persisted["occurrences"] = [
+            {
+                key: occurrence[key]
+                for key in (
+                    "split",
+                    "record_index",
+                    "record_total",
+                    "dataset_path",
+                    "input_record",
+                    "original_odrl_record",
+                    "source_order",
+                )
+            }
+            for occurrence in occurrences
+        ]
+        state_records.append(persisted)
+        logger.info(
+            "batch_prepare unique=%d/%d custom_id=%s duplicates=%d status=prepared",
+            unique_index,
+            len(grouped),
+            custom_id,
+            len(occurrences) - 1,
+        )
 
     if not request_records:
         raise ValueError("The selected datasets contain no records.")
@@ -500,6 +610,12 @@ async def prepare_batch_job(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_name": resolved_model,
         "request_count": len(request_records),
+        "source_record_count": total_occurrences,
+        "unique_text_count": len(grouped),
+        "duplicate_occurrence_count": total_occurrences - len(grouped),
+        "duplicate_text_group_count": duplicate_text_group_count,
+        "conflicting_original_gold_group_count": conflicting_original_gold_group_count,
+        "duplicate_policy": "one_ai_gold_per_exact_text_then_expand_to_all_occurrences",
         "request_settings": request_settings,
         "requests_path": str(requests_path),
         "states_path": str(states_path),
@@ -706,6 +822,8 @@ async def watch_and_finalize_batch_job(
     timeout_hours: float = 26.0,
     max_consecutive_errors: int = 12,
     strict: bool = True,
+    recovery_policy: str = "synchronous",
+    synchronous_recovery_limit: int | None = None,
     client: Any = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -837,7 +955,13 @@ async def watch_and_finalize_batch_job(
                     path,
                 )
                 try:
-                    await finalize_batch_job(path, strict=strict, client=api)
+                    await finalize_batch_job(
+                        path,
+                        strict=strict,
+                        client=api,
+                        recovery_policy=recovery_policy,
+                        synchronous_recovery_limit=synchronous_recovery_limit,
+                    )
                 except Exception as exc:
                     _, failed_manifest = _read_manifest(path)
                     failed_watch = dict(failed_manifest.get("watch") or watch)
@@ -962,26 +1086,557 @@ def _accumulate_usage(total: dict[str, int], result: dict[str, Any]) -> None:
     total["reasoning_tokens"] += int(completion_details.get("reasoning_tokens") or 0)
 
 
+def _accumulate_chat_response_usage(total: dict[str, int], response: Any) -> None:
+    """Include standard-API recovery usage in the same audit totals."""
+    usage = _get_value(response, "usage") or {}
+    completion_details = _get_value(usage, "completion_tokens_details") or {}
+    for target, source in (
+        ("prompt_tokens", "prompt_tokens"),
+        ("completion_tokens", "completion_tokens"),
+        ("total_tokens", "total_tokens"),
+    ):
+        total[target] += int(_get_value(usage, source, 0) or 0)
+    total["reasoning_tokens"] += int(
+        _get_value(completion_details, "reasoning_tokens", 0) or 0
+    )
+
+
+def _retryable_batch_result_error(error: str) -> bool:
+    """Return whether a fresh request can recover a model-level empty result."""
+    return error in {
+        "Batch response was truncated at max_completion_tokens.",
+        "Batch response contains empty message content.",
+        "Batch response contains no choices.",
+    }
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = str(os.getenv(name) or default).strip()
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer.")
+    return value
+
+
+def build_flat_ner_recovery_request(
+    prompt: str,
+    validation_error: str,
+    model_name: str,
+    *,
+    reasoning_effort: str = "medium",
+    max_output_tokens: int = 16000,
+) -> dict[str, Any]:
+    """Build the same strict request for synchronous or discounted recovery."""
+    retry_prompt = (
+        prompt
+        + "\n\nFLAT-NER RECOVERY: The following response contract replaces the "
+        "earlier response-format contract. The previous answer was rejected by the "
+        "training-data validator for this exact reason:\n"
+        + validation_error
+        + "\nReturn exactly one JSON object with keys validated_policy_rules and "
+        "corrected_entities. Preserve all real policy components. Each corrected_entities "
+        "item must have integer start, integer end, label, and text. start/end are "
+        "zero-based Python half-open character offsets into SOURCE, and text must equal "
+        "SOURCE[start:end] exactly, including case and punctuation. Allowed labels are "
+        "ASSIGNEE, ACTION, ASSET, CONSTRAINT, PURPOSE, RULE_TYPE-PERMISSION, "
+        "RULE_TYPE-OBLIGATION, and RULE_TYPE-PROHIBITION. Entity spans must be pairwise "
+        "non-overlapping. Include shared text only once. Never put an ACTION inside an "
+        "ASSIGNEE/ASSET, or an entity inside CONSTRAINT/PURPOSE. Every non-empty "
+        "ACTION, CONSTRAINT, and PURPOSE entity must occur inside that rule's source_text. "
+        "Repeated verbs in different numbered clauses require separate ACTION entities. "
+        "Only an identical ASSIGNEE or ASSET may be reused across coordinated rules. "
+        "Do not output entities that are not represented by a validated_policy_rules "
+        "component. Every component is optional, including ACTION and rule_type. Use an "
+        "empty string whenever a component cannot be identified confidently as an exact "
+        "source span. Do not invent a rule type or any other component. A partial grounded "
+        "rule, or empty arrays when no component is reliable, is valid."
+    )
+    request = build_chat_completion_request(retry_prompt, model_name)
+    rule_properties = {
+        name: {"type": "string"}
+        for name in (
+            "source_text", "assignee", "action", "asset",
+            "attributed_party", "rule_type", "constraint", "purpose",
+        )
+    }
+    entity_properties = {
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 1},
+        "label": {
+            "type": "string",
+            "enum": [
+                "ASSIGNEE", "ACTION", "ASSET", "CONSTRAINT", "PURPOSE",
+                "RULE_TYPE-PERMISSION", "RULE_TYPE-OBLIGATION",
+                "RULE_TYPE-PROHIBITION",
+            ],
+        },
+        "text": {"type": "string"},
+    }
+    request["response_format"] = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "odrl_flat_ner_recovery",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "validated_policy_rules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": rule_properties,
+                            "required": list(rule_properties),
+                            "additionalProperties": False,
+                        },
+                    },
+                    "corrected_entities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": entity_properties,
+                            "required": list(entity_properties),
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["validated_policy_rules", "corrected_entities"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    request["reasoning_effort"] = reasoning_effort
+    request["max_completion_tokens"] = max_output_tokens
+    return request
+
+
+def _validate_recovery_alignment(
+    source_text: str,
+    rules: list[dict[str, Any]],
+    entities: list[dict[str, Any]],
+) -> None:
+    """Require recovered flat entities to represent each rule coherently.
+
+    Every component is optional. ASSIGNEE and ASSET may be inherited from an
+    earlier coordinated clause. A non-empty ACTION, CONSTRAINT, or PURPOSE must
+    have its own occurrence inside that rule's source_text. This prevents one
+    repeated verb such as ``ensure`` from satisfying several numbered rules.
+    """
+    field_labels = {
+        "assignee": "ASSIGNEE",
+        "action": "ACTION",
+        "asset": "ASSET",
+        "constraint": "CONSTRAINT",
+        "purpose": "PURPOSE",
+    }
+    reusable_fields = {"assignee", "asset"}
+    represented_components: set[tuple[str, str]] = set()
+    rule_types: set[str] = set()
+
+    for rule_index, rule in enumerate(rules, start=1):
+        source_quote = str(rule.get("source_text") or "")
+        source_scopes: list[tuple[int, int]] = []
+        cursor = 0
+        while source_quote and cursor <= len(source_text) - len(source_quote):
+            found = source_text.find(source_quote, cursor)
+            if found < 0:
+                break
+            source_scopes.append((found, found + len(source_quote)))
+            cursor = found + 1
+        if not source_scopes:
+            raise ValueError(
+                f"recovery policy rule {rule_index} source_text is not an exact SOURCE quote"
+            )
+
+        rule_type = str(rule.get("rule_type") or "")
+        if rule_type:
+            rule_types.add(rule_type)
+        for field, label in field_labels.items():
+            quote = str(rule.get(field) or "")
+            if not quote:
+                continue
+            represented_components.add((label, quote))
+            matches = [
+                entity
+                for entity in entities
+                if entity["label"] == label
+                and source_text[entity["start"]:entity["end"]] == quote
+            ]
+            if not matches:
+                raise ValueError(
+                    f"recovery policy rule {rule_index} {field} has no matching "
+                    "corrected entity"
+                )
+            if field not in reusable_fields and not any(
+                scope_start <= entity["start"]
+                and entity["end"] <= scope_end
+                for entity in matches
+                for scope_start, scope_end in source_scopes
+            ):
+                raise ValueError(
+                    f"recovery policy rule {rule_index} {field} has no matching "
+                    "entity inside its source_text"
+                )
+
+    for entity_index, entity in enumerate(entities, start=1):
+        label = str(entity["label"])
+        quote = source_text[entity["start"]:entity["end"]]
+        if label.startswith("RULE_TYPE-"):
+            expected_type = label[len("RULE_TYPE-"):].lower()
+            if expected_type not in rule_types:
+                raise ValueError(
+                    f"recovery entity {entity_index} has an unrepresented rule marker"
+                )
+        elif (label, quote) not in represented_components:
+            raise ValueError(
+                f"recovery entity {entity_index} is not represented by any policy rule"
+            )
+
+    for rule_type in rule_types:
+        expected_label = f"RULE_TYPE-{rule_type.upper()}"
+        if not any(entity["label"] == expected_label for entity in entities):
+            raise ValueError(
+                f"recovery rules have no {expected_label} marker entity"
+            )
+
+
+def _recover_batch_response(
+    api: Any,
+    *,
+    prompt: str,
+    model_name: str,
+    custom_id: str,
+    usage: dict[str, int],
+) -> tuple[Any | None, list[str], int]:
+    """Retry only an unusable Batch result using constrained reasoning.
+
+    This deliberately uses the standard synchronous API after a Batch has
+    completed. It preserves every successful discounted Batch result and pays
+    the standard rate only for the exceptional record. A result is returned
+    only after its required JSON contract has been parsed successfully.
+    """
+    enabled = str(
+        os.getenv("ODRL_CORRECTION_RECOVER_FAILED_BATCH", "true")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return None, ["Targeted failed-record recovery is disabled."], 0
+
+    attempts = _positive_int_env("ODRL_CORRECTION_RECOVERY_ATTEMPTS", 2)
+    max_tokens = _positive_int_env(
+        "ODRL_CORRECTION_RECOVERY_MAX_OUTPUT_TOKENS", 16000
+    )
+    effort = str(
+        os.getenv("ODRL_CORRECTION_RECOVERY_REASONING_EFFORT", "low")
+    ).strip().lower()
+    if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+        raise ValueError(
+            "ODRL_CORRECTION_RECOVERY_REASONING_EFFORT must be one of: "
+            "high, low, max, medium, none, xhigh"
+        )
+
+    recovery_prompt = (
+        prompt
+        + "\n\nRECOVERY INSTRUCTION: The previous request exhausted its output "
+        "budget while reasoning and returned no usable answer. Do not repeat "
+        "extended analysis. Apply the rules above directly and return the final "
+        "JSON object immediately. Keep the answer concise."
+    )
+    warnings: list[str] = []
+    chat = getattr(getattr(api, "chat", None), "completions", None)
+    create = getattr(chat, "create", None)
+    if not callable(create):
+        return None, ["OpenAI client does not support targeted chat recovery."], 0
+
+    for attempt in range(1, attempts + 1):
+        request = build_chat_completion_request(recovery_prompt, model_name)
+        request["reasoning_effort"] = effort
+        request["max_completion_tokens"] = max_tokens
+        logger.warning(
+            "batch_recovery custom_id=%s attempt=%d/%d status=started "
+            "reasoning_effort=%s max_completion_tokens=%d",
+            custom_id,
+            attempt,
+            attempts,
+            effort,
+            max_tokens,
+        )
+        try:
+            response = create(**request)
+            _accumulate_chat_response_usage(usage, response)
+            choices = _get_value(response, "choices") or []
+            if not choices:
+                raise ValueError("Recovery response contains no choices.")
+            choice = choices[0]
+            finish_reason = str(_get_value(choice, "finish_reason", "") or "")
+            if finish_reason == "length":
+                raise ValueError("Recovery response was truncated.")
+            message = _get_value(choice, "message") or {}
+            content = _get_value(message, "content")
+            parse_ai_response(content)
+            logger.warning(
+                "batch_recovery custom_id=%s attempt=%d/%d status=completed",
+                custom_id,
+                attempt,
+                attempts,
+            )
+            return content, warnings, attempt
+        except Exception as exc:
+            detail = f"Recovery attempt {attempt}/{attempts} failed: {type(exc).__name__}: {exc}"
+            warnings.append(detail)
+            logger.warning(
+                "batch_recovery custom_id=%s attempt=%d/%d status=failed error=%s:%s",
+                custom_id,
+                attempt,
+                attempts,
+                type(exc).__name__,
+                exc,
+            )
+    return None, warnings, attempts
+
+
+async def _recover_invalid_flat_ner(
+    api: Any,
+    *,
+    state: ODRLCorrectionState,
+    prompt: str,
+    validation_error: str,
+    model_name: str,
+    custom_id: str,
+    usage: dict[str, int],
+    attempts_override: int | None = None,
+) -> tuple[dict[str, Any] | None, Any | None, list[str], int]:
+    """Retry only a semantically invalid flat-NER answer and revalidate it."""
+    enabled = str(
+        os.getenv("ODRL_CORRECTION_RECOVER_INVALID_NER", "true")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return None, None, ["Invalid flat-NER recovery is disabled."], 0
+    chat = getattr(getattr(api, "chat", None), "completions", None)
+    create = getattr(chat, "create", None)
+    if not callable(create):
+        return None, None, ["OpenAI client does not support flat-NER recovery."], 0
+
+    attempts = (
+        attempts_override
+        if attempts_override is not None
+        else _positive_int_env("ODRL_CORRECTION_INVALID_NER_ATTEMPTS", 3)
+    )
+    if attempts < 1:
+        raise ValueError("attempts_override must be positive")
+    max_tokens = _positive_int_env(
+        "ODRL_CORRECTION_INVALID_NER_MAX_OUTPUT_TOKENS", 16000
+    )
+    effort = str(
+        os.getenv("ODRL_CORRECTION_INVALID_NER_REASONING_EFFORT", "medium")
+    ).strip().lower()
+    if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
+        raise ValueError(
+            "ODRL_CORRECTION_INVALID_NER_REASONING_EFFORT must be one of: "
+            "high, low, max, medium, none, xhigh"
+        )
+
+    warnings: list[str] = [
+        f"Initial Batch annotation failed flat-NER validation and was retried: "
+        f"{validation_error}"
+    ]
+    for attempt in range(1, attempts + 1):
+        request = build_flat_ner_recovery_request(
+            prompt,
+            validation_error,
+            model_name,
+            reasoning_effort=effort,
+            max_output_tokens=max_tokens,
+        )
+        logger.warning(
+            "flat_ner_recovery custom_id=%s attempt=%d/%d status=started",
+            custom_id,
+            attempt,
+            attempts,
+        )
+        try:
+            response = create(**request)
+            _accumulate_chat_response_usage(usage, response)
+            choices = _get_value(response, "choices") or []
+            if not choices:
+                raise ValueError("Recovery response contains no choices.")
+            choice = choices[0]
+            if str(_get_value(choice, "finish_reason", "") or "") == "length":
+                raise ValueError("Recovery response was truncated.")
+            content = _get_value(_get_value(choice, "message") or {}, "content")
+            payload = parse_ai_response(content)
+            raw_entities = payload.get("corrected_entities")
+            if not isinstance(raw_entities, list):
+                raise ValueError("Recovery response has no corrected_entities list.")
+            source_text = str(state.get("source_text") or "")
+            entities: list[dict[str, Any]] = []
+            offset_adjustments: list[str] = []
+            for entity_index, raw in enumerate(raw_entities, start=1):
+                if not isinstance(raw, dict):
+                    raise ValueError(f"recovery entity {entity_index} is not an object")
+                start = int(raw.get("start"))
+                end = int(raw.get("end"))
+                quoted = str(raw.get("text") or "")
+                if not 0 <= start < end <= len(source_text):
+                    start = end = -1
+                if start < 0 or source_text[start:end] != quoted:
+                    # Models are much better at quoting a component than at
+                    # counting long-string character offsets. Relocate only an
+                    # exact, case-sensitive quote and choose the occurrence
+                    # nearest the proposed start. The ordinary overlap and
+                    # semantic checks still run below.
+                    matches: list[tuple[int, int]] = []
+                    cursor = 0
+                    while quoted and cursor <= len(source_text) - len(quoted):
+                        found = source_text.find(quoted, cursor)
+                        if found < 0:
+                            break
+                        matches.append((found, found + len(quoted)))
+                        cursor = found + 1
+                    if not matches:
+                        raise ValueError(
+                            f"recovery entity {entity_index} text is not an exact SOURCE quote"
+                        )
+                    proposed_start = int(raw.get("start") or 0)
+                    start, end = min(
+                        matches,
+                        key=lambda span: (abs(span[0] - proposed_start), span[0]),
+                    )
+                    offset_adjustments.append(
+                        f"entity {entity_index} relocated to exact SOURCE offsets "
+                        f"[{start}, {end})"
+                    )
+                entities.append({
+                    "start": start,
+                    "end": end,
+                    "label": str(raw.get("label") or ""),
+                })
+            entities = validate_flat_ner_entities(source_text, entities)
+            rules = normalize_rules(payload["validated_policy_rules"], source_text)
+            entity_quotes = {
+                (entity["label"], source_text[entity["start"]:entity["end"]])
+                for entity in entities
+            }
+            component_labels = {
+                "assignee": "ASSIGNEE",
+                "action": "ACTION",
+                "asset": "ASSET",
+                "constraint": "CONSTRAINT",
+                "purpose": "PURPOSE",
+            }
+            for rule_index, rule in enumerate(rules, start=1):
+                if rule.get("rule_type") and rule.get("rule_type") not in {
+                    "permission", "obligation", "prohibition",
+                }:
+                    raise ValueError(
+                        f"recovery policy rule {rule_index} has invalid rule_type"
+                    )
+                for field, label in component_labels.items():
+                    quote = str(rule.get(field) or "")
+                    if quote and (label, quote) not in entity_quotes:
+                        raise ValueError(
+                            f"recovery policy rule {rule_index} {field} has no "
+                            "matching corrected entity"
+                        )
+                if rule.get("rule_type"):
+                    rule_label = f"RULE_TYPE-{str(rule['rule_type']).upper()}"
+                    if not any(entity["label"] == rule_label for entity in entities):
+                        raise ValueError(
+                            f"recovery policy rule {rule_index} has no matching rule marker entity"
+                        )
+                rule["policy_rule_id"] = f"policy-rule-{rule_index}"
+                rule["selected_from"] = "ai_reconciliation"
+            _validate_recovery_alignment(source_text, rules, entities)
+            retry_state = dict(state)
+            retry_state.update({
+                "validated_policy_rules": rules,
+                "ai_rules": rules,
+                "selected_from": "ai_reconciliation",
+                "corrected_entities": entities,
+                "grounding_warnings": [],
+                "correction_warnings": [],
+                "correction_comparison": compare_entity_sets(
+                    list(state.get("original_entities") or []), entities
+                ),
+                "flat_ner_validated": True,
+                "overlap_count": 0,
+                "allow_partial_rules": True,
+            })
+            validation = await node_flat_ner_validate(retry_state)
+            update = {
+                key: retry_state[key]
+                for key in (
+                    "validated_policy_rules", "ai_rules", "selected_from",
+                    "corrected_entities", "grounding_warnings",
+                    "correction_warnings", "correction_comparison",
+                    "flat_ner_validated", "overlap_count",
+                    "allow_partial_rules",
+                )
+            }
+            update.update(validation)
+            if offset_adjustments:
+                warnings.append(
+                    "Recovery offsets were deterministically corrected: "
+                    + "; ".join(offset_adjustments)
+                )
+            logger.warning(
+                "flat_ner_recovery custom_id=%s attempt=%d/%d status=completed",
+                custom_id,
+                attempt,
+                attempts,
+            )
+            return update, content, warnings, attempt
+        except Exception as exc:
+            detail = (
+                f"Flat-NER recovery attempt {attempt}/{attempts} failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            warnings.append(detail)
+            logger.warning(
+                "flat_ner_recovery custom_id=%s attempt=%d/%d status=failed "
+                "error=%s:%s",
+                custom_id,
+                attempt,
+                attempts,
+                type(exc).__name__,
+                exc,
+            )
+    return None, None, warnings, attempts
+
+
 async def finalize_batch_job(
     manifest_path: str | Path,
     *,
     strict: bool = True,
     client: Any = None,
+    recovery_policy: str = "synchronous",
+    synchronous_recovery_limit: int | None = None,
+    reuse_downloaded_results: bool = False,
 ) -> tuple[list[Path], list[Path], list[ODRLCorrectionState]]:
     """Download Batch results, reconcile them, and write all split outputs."""
-    path, manifest = _read_manifest(manifest_path)
-    api = client or _create_client()
-    if manifest.get("status") != "completed" or not manifest.get("output_file_id"):
-        manifest = refresh_batch_status(path, client=api)
-    if manifest.get("status") != "completed":
-        raise RuntimeError(
-            f"Batch {manifest.get('batch_id')} is {manifest.get('status')}; "
-            "finalize only after it is completed."
+    if recovery_policy not in {
+        "synchronous", "defer", "batch_only", "batch_then_sync"
+    }:
+        raise ValueError(
+            "recovery_policy must be synchronous, defer, batch_only, or batch_then_sync"
         )
+    if synchronous_recovery_limit is not None and synchronous_recovery_limit < 0:
+        raise ValueError("synchronous_recovery_limit cannot be negative")
+    path, manifest = _read_manifest(manifest_path)
+    results_path = Path(str(manifest["results_path"]))
+    api = client
+    if not (reuse_downloaded_results and results_path.is_file()):
+        api = api or _create_client()
+        if manifest.get("status") != "completed" or not manifest.get("output_file_id"):
+            manifest = refresh_batch_status(path, client=api)
+        if manifest.get("status") != "completed":
+            raise RuntimeError(
+                f"Batch {manifest.get('batch_id')} is {manifest.get('status')}; "
+                "finalize only after it is completed."
+            )
     _verify_artifact_integrity(manifest)
-    _download_batch_files(path, manifest, api)
+    if not (reuse_downloaded_results and results_path.is_file()):
+        _download_batch_files(path, manifest, api)
 
-    result_records = _read_jsonl(Path(str(manifest["results_path"])))
+    result_records = _read_jsonl(results_path)
     results_by_id: dict[str, dict[str, Any]] = {}
     for result in result_records:
         custom_id = str(result.get("custom_id") or "")
@@ -1024,6 +1679,32 @@ async def finalize_batch_job(
         "total_tokens": 0,
     }
     failures: list[str] = []
+    recovery_count = 0
+    flat_ner_recovery_count = 0
+    recovery_attempt_count = 0
+    recovered_custom_ids: list[str] = []
+    synchronous_recovery_records = 0
+    deferred_recoveries: list[dict[str, Any]] = []
+    manual_review_records: list[dict[str, Any]] = []
+    deferred_path = path.parent / "deferred_recovery.jsonl"
+    batch_recovery_path = path.parent / "batch_recovery_responses.jsonl"
+    batch_recovery_responses = {
+        str(item.get("custom_id") or ""): item
+        for item in (
+            _read_jsonl(batch_recovery_path) if batch_recovery_path.is_file() else []
+        )
+        if item.get("custom_id")
+    }
+    flat_recovery_cache_path = path.parent / "flat_ner_recovery_cache.jsonl"
+    flat_recovery_cache = {
+        str(item.get("custom_id") or ""): item
+        for item in (
+            _read_jsonl(flat_recovery_cache_path)
+            if flat_recovery_cache_path.is_file()
+            else []
+        )
+        if item.get("custom_id")
+    }
 
     for state_record in state_records:
         custom_id = str(state_record.get("custom_id") or "")
@@ -1031,49 +1712,343 @@ async def finalize_batch_job(
         stored = state_record.get("state") or {}
         result = results_by_id.get(custom_id)
         error = _batch_result_error(result)
+        override: Any = None
+        recovered: Any = None
+        if result is not None:
+            # Count paid Batch usage even when the result is unusable. This is
+            # especially important for a 128k reasoning-only truncation.
+            _accumulate_usage(usage, result)
+        recovery_warnings: list[str] = []
+        if (
+            error
+            and _retryable_batch_result_error(error)
+            and recovery_policy == "synchronous"
+            and (
+                synchronous_recovery_limit is None
+                or synchronous_recovery_records < synchronous_recovery_limit
+            )
+        ):
+            source_text = str(stored.get("source_text") or "")
+            endpoint_rules = normalize_endpoint_rules(
+                stored.get("endpoint_rules"), source_text
+            )
+            retry_prompt = render_correction_prompt(
+                prompt_template,
+                source_text,
+                list(stored.get("original_entities") or []),
+                endpoint_rules,
+                list(stored.get("duplicate_original_variants") or []),
+            )
+            # Finalization already performs synchronous SDK file/status calls.
+            # Keep this exceptional one-record call synchronous as well; using
+            # a default executor here can delay IsolatedAsyncio loop teardown.
+            recovered, recovery_warnings, attempts_used = _recover_batch_response(
+                api,
+                prompt=retry_prompt,
+                model_name=str(stored.get("model_name") or manifest["model_name"]),
+                custom_id=custom_id,
+                usage=usage,
+            )
+            recovery_attempt_count += attempts_used
+            if attempts_used:
+                synchronous_recovery_records += 1
+            if recovered is not None:
+                override = recovered
+                recovery_count += 1
+                recovered_custom_ids.append(custom_id)
+                error = ""
         if error:
-            failures.append(f"{custom_id}: {error}")
-            if strict:
+            detail = error
+            if recovery_warnings:
+                detail += " " + " ".join(recovery_warnings)
+            failures.append(f"{custom_id}: {detail}")
+            if strict and recovery_policy == "synchronous":
                 continue
             override: Any = {"validated_policy_rules": []}
         else:
-            assert result is not None
-            body = ((result.get("response") or {}).get("body") or {})
-            override = body["choices"][0]["message"]["content"]
-            _accumulate_usage(usage, result)
+            if recovered is None:
+                assert result is not None
+                body = ((result.get("response") or {}).get("body") or {})
+                override = body["choices"][0]["message"]["content"]
 
         input_record = stored.get("input_record") or {}
         state = create_correction_state(input_record)
         state.update(stored)
         state["prompt_template"] = prompt_template
         state["ai_response_override"] = override
+        if recovery_warnings:
+            state["correction_warnings"] = list(
+                state.get("correction_warnings") or []
+            ) + recovery_warnings
         if error:
             state["correction_warnings"] = list(
                 state.get("correction_warnings") or []
             ) + [error]
         correction_update = await node_odrl_correct(state)
-        if strict and correction_update.get("selected_from") != "ai_reconciliation":
+        reconciliation_error = ""
+        if correction_update.get("selected_from") != "ai_reconciliation":
             warnings = correction_update.get("correction_warnings") or []
-            detail = str(warnings[-1]) if warnings else "AI reconciliation fallback used."
-            failures.append(f"{custom_id}: {detail}")
-            continue
+            reconciliation_error = (
+                str(warnings[-1]) if warnings else "AI reconciliation fallback used."
+            )
+            if strict and recovery_policy == "synchronous":
+                failures.append(f"{custom_id}: {reconciliation_error}")
+                continue
         state.update(correction_update)
-        state.update(await node_odrl_output(state))
-        split_states.setdefault(split, []).append(state)
+        try:
+            if error or reconciliation_error:
+                raise ValueError(error or reconciliation_error)
+            state.update(await node_flat_ner_validate(state))
+        except Exception as exc:
+            validation_error = f"{type(exc).__name__}: {exc}"
+            cached_recovery = flat_recovery_cache.get(custom_id)
+            recovered_update = None
+            recovered_override = None
+            validation_warnings: list[str] = []
+            attempts_used = 0
+            if cached_recovery:
+                candidate = dict(cached_recovery.get("update") or {})
+                candidate_state = dict(state)
+                candidate_state.update(candidate)
+                try:
+                    _validate_recovery_alignment(
+                        str(candidate_state.get("source_text") or ""),
+                        list(candidate_state.get("validated_policy_rules") or []),
+                        list(candidate_state.get("corrected_entities") or []),
+                    )
+                    candidate.update(await node_flat_ner_validate(candidate_state))
+                    recovered_update = candidate
+                    recovered_override = cached_recovery.get("response")
+                    validation_warnings = [
+                        "Reused a previously validated flat-NER recovery checkpoint."
+                    ]
+                    logger.warning(
+                        "flat_ner_recovery custom_id=%s status=cache_hit",
+                        custom_id,
+                    )
+                except Exception as cache_exc:
+                    logger.warning(
+                        "flat_ner_recovery custom_id=%s status=cache_invalid error=%s:%s",
+                        custom_id,
+                        type(cache_exc).__name__,
+                        cache_exc,
+                    )
+                    flat_recovery_cache.pop(custom_id, None)
+            if recovered_update is None:
+                recovery_prompt = render_correction_prompt(
+                    prompt_template,
+                    str(state.get("source_text") or ""),
+                    list(state.get("original_entities") or []),
+                    normalize_endpoint_rules(
+                        state.get("endpoint_rules"),
+                        str(state.get("source_text") or ""),
+                    ),
+                    list(state.get("duplicate_original_variants") or []),
+                )
+                batch_item = batch_recovery_responses.get(custom_id)
+                if batch_item and batch_item.get("content"):
+                    content = batch_item["content"]
+
+                    class _StaticCompletions:
+                        def create(self, **_: Any) -> dict[str, Any]:
+                            return {
+                                "choices": [{
+                                    "message": {"content": content},
+                                    "finish_reason": "stop",
+                                }]
+                            }
+
+                    class _StaticAPI:
+                        chat = type("Chat", (), {"completions": _StaticCompletions()})()
+
+                    recovered_update, recovered_override, validation_warnings, _ = (
+                        await _recover_invalid_flat_ner(
+                            _StaticAPI(),
+                            state=state,
+                            prompt=recovery_prompt,
+                            validation_error=validation_error,
+                            model_name=str(stored.get("model_name") or manifest["model_name"]),
+                            custom_id=custom_id,
+                            usage=usage,
+                            attempts_override=1,
+                        )
+                    )
+                    attempts_used = 0
+                if recovered_update is None and recovery_policy in {
+                    "synchronous", "batch_then_sync"
+                } and (
+                    synchronous_recovery_limit is None
+                    or synchronous_recovery_records < synchronous_recovery_limit
+                ):
+                    recovered_update, recovered_override, validation_warnings, attempts_used = (
+                        await _recover_invalid_flat_ner(
+                            api,
+                            state=state,
+                            prompt=recovery_prompt,
+                            validation_error=validation_error,
+                            model_name=str(stored.get("model_name") or manifest["model_name"]),
+                            custom_id=custom_id,
+                            usage=usage,
+                        )
+                    )
+                    if attempts_used:
+                        synchronous_recovery_records += 1
+                elif recovery_policy == "defer":
+                    effort = str(os.getenv(
+                        "ODRL_CORRECTION_BATCH_RECOVERY_REASONING_EFFORT", "medium"
+                    )).strip().lower()
+                    max_tokens = _positive_int_env(
+                        "ODRL_CORRECTION_BATCH_RECOVERY_MAX_OUTPUT_TOKENS", 16000
+                    )
+                    deferred_recoveries.append({
+                        "custom_id": custom_id,
+                        "validation_error": validation_error,
+                        "state": stored,
+                        "request": {
+                            "custom_id": custom_id,
+                            "method": "POST",
+                            "url": "/v1/chat/completions",
+                            "body": build_flat_ner_recovery_request(
+                                recovery_prompt,
+                                validation_error,
+                                str(stored.get("model_name") or manifest["model_name"]),
+                                reasoning_effort=effort,
+                                max_output_tokens=max_tokens,
+                            ),
+                        },
+                    })
+            recovery_attempt_count += attempts_used
+            if recovered_update is not None:
+                flat_recovery_cache[custom_id] = {
+                    "custom_id": custom_id,
+                    "response": recovered_override,
+                    "update": recovered_update,
+                }
+                _write_jsonl_atomic(
+                    flat_recovery_cache_path,
+                    flat_recovery_cache.values(),
+                )
+                state.update(recovered_update)
+                override = recovered_override
+                recovery_count += 1
+                flat_ner_recovery_count += 1
+                if custom_id not in recovered_custom_ids:
+                    recovered_custom_ids.append(custom_id)
+                state["correction_warnings"] = list(
+                    state.get("correction_warnings") or []
+                ) + validation_warnings
+            else:
+                detail = validation_error
+                if validation_warnings:
+                    detail += " " + " ".join(validation_warnings)
+                if recovery_policy == "synchronous":
+                    failures.append(f"{custom_id}: {detail}")
+                if strict and recovery_policy == "synchronous":
+                    continue
+                original_entities = [
+                    dict(entity) for entity in state.get("original_entities") or []
+                ]
+                original_odrl = _original_odrl_record_from_state(state)
+                state.update({
+                    "corrected_entities": original_entities,
+                    "validated_policy_rules": [
+                        dict(rule) for rule in original_odrl.get("odrl") or []
+                    ],
+                    "ai_rules": [],
+                    "selected_from": "original_manual_review",
+                    "flat_ner_validated": False,
+                    "overlap_count": 0,
+                })
+                warning = f"flat NER validation failed; original labels retained: {detail}"
+                state["correction_warnings"] = list(
+                    state.get("correction_warnings") or []
+                ) + [warning]
+                manual_review_records.append({
+                    "custom_id": custom_id,
+                    "text": str(state.get("source_text") or ""),
+                    "original_entities": original_entities,
+                    "reason": detail,
+                    "recovery_status": (
+                        "queued_for_batch" if recovery_policy == "defer"
+                        else "batch_recovery_failed"
+                    ),
+                })
+
+        occurrences = state_record.get("occurrences") or [{
+            "split": split,
+            "record_index": int(stored.get("record_index") or 0),
+            "record_total": int(stored.get("record_total") or 0),
+            "dataset_path": str(stored.get("dataset_path") or ""),
+            "input_record": input_record,
+        }]
+        for occurrence in occurrences:
+            occurrence_record = dict(occurrence.get("input_record") or {})
+            expanded = create_correction_state(occurrence_record)
+            expanded.update(stored)
+            expanded.update({
+                "input_record": occurrence_record,
+                "source_text": str(occurrence_record.get("text") or ""),
+                "original_entities": [
+                    dict(entity) for entity in occurrence_record.get("entities") or []
+                ],
+                "record_index": int(occurrence.get("record_index") or 0),
+                "record_total": int(occurrence.get("record_total") or 0),
+                "dataset_path": str(occurrence.get("dataset_path") or ""),
+                "prompt_template": prompt_template,
+                "ai_response_override": override,
+                "validated_policy_rules": [
+                    dict(rule) for rule in state.get("validated_policy_rules") or []
+                ],
+                "corrected_entities": [
+                    dict(entity) for entity in state.get("corrected_entities") or []
+                ],
+                "selected_from": state.get("selected_from"),
+                "correction_warnings": list(state.get("correction_warnings") or []),
+                "flat_ner_validated": state.get("flat_ner_validated", False),
+                "overlap_count": state.get("overlap_count", 0),
+                "duplicate_gold_custom_id": custom_id,
+                "duplicate_group_size": len(occurrences),
+                "original_odrl_record": occurrence.get("original_odrl_record"),
+            })
+            expanded["correction_comparison"] = compare_entity_sets(
+                list(expanded.get("original_entities") or []),
+                list(expanded.get("corrected_entities") or []),
+            )
+            expanded.update(await node_odrl_output(expanded))
+            split_states.setdefault(str(occurrence.get("split") or split), []).append(
+                expanded
+            )
         logger.info(
-            "batch_finalize custom_id=%s status=completed selected_from=%s warnings=%d",
+            "batch_finalize custom_id=%s status=completed selected_from=%s "
+            "expanded_records=%d warnings=%d",
             custom_id,
             state.get("selected_from") or "",
+            len(occurrences),
             len(state.get("correction_warnings") or []),
         )
 
-    if failures and strict:
+    if failures and strict and recovery_policy == "synchronous":
         preview = "\n".join(failures[:20])
         suffix = "" if len(failures) <= 20 else f"\n... and {len(failures) - 20} more"
         raise RuntimeError(
             "Batch finalization stopped to protect dataset quality. "
             "Fix or resubmit the failed records:\n" + preview + suffix
         )
+
+    gold_by_text: dict[str, tuple[tuple[int, int, str], ...]] = {}
+    for states in split_states.values():
+        for expanded in states:
+            text_value = str(expanded.get("source_text") or "")
+            signature = tuple(
+                (int(entity["start"]), int(entity["end"]), str(entity["label"]))
+                for entity in expanded.get("corrected_entities") or []
+            )
+            previous = gold_by_text.setdefault(text_value, signature)
+            if previous != signature:
+                raise RuntimeError(
+                    "Duplicate-gold invariant failed: identical source text received "
+                    "different corrected entities. No datasets were written."
+                )
 
     output_dir = Path(str(manifest["output_dir"]))
     model_suffix = _safe_model_name(str(manifest["model_name"]))
@@ -1084,7 +2059,16 @@ async def finalize_batch_job(
     all_states: list[ODRLCorrectionState] = []
     for split_info in manifest.get("splits") or []:
         split = str(split_info["split"])
-        states = split_states.get(split) or []
+        states = sorted(
+            split_states.get(split) or [],
+            key=lambda item: int(item.get("record_index") or 0),
+        )
+        expected_count = int(split_info.get("record_count") or 0)
+        if len(states) != expected_count:
+            raise RuntimeError(
+                f"Expanded split {split} has {len(states)} records; expected "
+                f"{expected_count}. No partial dataset should be trusted."
+            )
         ner_path = output_dir / f"{split}_correct_with_agent_{model_suffix}.txt"
         odrl_path = output_dir / f"{split}_odrl_with_agent_{model_suffix}.txt"
         diff_path = output_dir / f"{split}_diffs_from_correct_{model_suffix}.txt"
@@ -1092,7 +2076,10 @@ async def finalize_batch_job(
         _write_jsonl_atomic(ner_path, (state["corrected_record"] for state in states))
         _write_jsonl_atomic(odrl_path, (state["text_odrl_record"] for state in states))
         for state in states:
-            original_odrl_record = _original_odrl_record_from_state(state)
+            original_odrl_record = dict(
+                state.get("original_odrl_record")
+                or _original_odrl_record_from_state(state)
+            )
             state["original_odrl_record"] = original_odrl_record
             state["corrected_odrl_record"] = dict(state["text_odrl_record"] or {})
             state["odrl_diff_record"] = build_odrl_diff_record(state)
@@ -1124,18 +2111,52 @@ async def finalize_batch_job(
         odrl_diff_paths.append(odrl_diff_path)
         all_states.extend(states)
 
-    manifest["status"] = "finalized"
+    if deferred_recoveries:
+        _write_jsonl_atomic(deferred_path, deferred_recoveries)
+    elif deferred_path.is_file() and recovery_policy == "defer":
+        _write_jsonl_atomic(deferred_path, [])
+    manual_review_path = path.parent / "manual_review.jsonl"
+    _write_jsonl_atomic(manual_review_path, manual_review_records)
+    manifest["status"] = (
+        "finalized_pending_recovery" if deferred_recoveries else "finalized"
+    )
     manifest["finalized_at"] = datetime.now(timezone.utc).isoformat()
     manifest["usage"] = usage
     manifest["fallback_count"] = len(failures)
+    manifest["recovery_count"] = recovery_count
+    manifest["flat_ner_recovery_count"] = flat_ner_recovery_count
+    manifest["recovery_attempt_count"] = recovery_attempt_count
+    manifest["synchronous_recovery_records"] = synchronous_recovery_records
+    manifest["deferred_recovery_count"] = len(deferred_recoveries)
+    manifest["deferred_recovery_path"] = str(deferred_path)
+    manifest["manual_review_count"] = len(manual_review_records)
+    manifest["manual_review_path"] = str(manual_review_path)
+    manifest["recovered_custom_ids"] = recovered_custom_ids
+    manifest["flat_ner_recovery_cache_path"] = str(flat_recovery_cache_path)
+    manifest["expanded_record_count"] = len(all_states)
+    manifest["duplicate_gold_verified"] = True
+    manifest["flat_ner_validation"] = {
+        "required": True,
+        "validated_record_count": sum(
+            bool(state.get("flat_ner_validated")) for state in all_states
+        ),
+        "manual_review_record_count": sum(
+            not bool(state.get("flat_ner_validated")) for state in all_states
+        ),
+        "remaining_overlap_count": sum(
+            not bool(state.get("flat_ner_validated")) for state in all_states
+        ),
+    }
     manifest["ner_outputs"] = [str(item) for item in ner_paths]
     manifest["odrl_outputs"] = [str(item) for item in odrl_paths]
     manifest["diff_outputs"] = [str(item) for item in diff_paths]
     manifest["odrl_diff_outputs"] = [str(item) for item in odrl_diff_paths]
     _write_json_atomic(path, manifest)
     logger.info(
-        "batch_finalize status=completed records=%d failures=%d usage=%s",
+        "batch_finalize status=completed records=%d unique_requests=%d "
+        "failures=%d usage=%s",
         len(all_states),
+        request_count,
         len(failures),
         usage,
     )

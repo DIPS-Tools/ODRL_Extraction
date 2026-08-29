@@ -238,6 +238,15 @@ def build_parser():
     parser.add_argument("--data_path", required=True, default="./data/")
     parser.add_argument("--save_dir", required=True, default="./save_models/")
     parser.add_argument("--word_embedding_model_path", required=True)  # e.g., "/home/.../bert-base-cased"
+    parser.add_argument(
+        "--correct_data_model",
+        default="",
+        metavar="DATA_TAG",
+        help=(
+            "Load the checkpoint trained with this dataset tag, for example "
+            "correct_data_with_agent_gpt-5.6-luna."
+        ),
+    )
     parser.add_argument("--label_type", choices=["BIO", "BIOES"], default="BIO",
                         help="Tagging scheme to use for labels.")
     parser.add_argument("--trust_remote_code", action="store_true")
@@ -350,8 +359,11 @@ if __name__ == '__main__':
     args = build_parser().parse_args()
     config = Config(args)
     config.rule_bias_alpha = args.rule_bias_alpha
+    if config.data_tag:
+        print(f"Corrected-data checkpoint tag: {config.data_tag}")
+    print(f"Checkpoint prefix: {config.save_path}")
     model = load_model(config)
     uvicorn.run(app, host=args.host, port=args.port)
 
     # Run the FastAPI rule-bias application with Contract-BERT:
-    # python app_rule_bias.py --model contract-bert-lstm-crf --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts --do_test --num_epochs 20 --batch_size 16 --rnn_layers 1 --max_length 400 --label_type BIO --rule_bias_alpha 3.0 --device cpu --port 5001
+    # python app_rule_bias.py --model contract-bert-lstm-crf --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts --do_test --num_epochs 20 --batch_size 16 --rnn_layers 1 --max_length 400 --label_type BIO --rule_bias_alpha 3.0 --correct_data_model correct_data_with_agent_gpt-5.6-luna --device cpu --port 5001

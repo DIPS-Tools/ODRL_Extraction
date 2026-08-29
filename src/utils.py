@@ -222,16 +222,19 @@ def get_ner_fmeasure(golden_lists, predict_lists, label_type='BIO'):
     sent_num = len(golden_lists)
     golden_full, predict_full, right_full = [], [], []
     right_tag, all_tag = 0, 0
+    special_labels = {'O', '<pad>', '<start>', '<eos>'}
 
     for idx in range(sent_num):
         gold = golden_lists[idx]
         pred = predict_lists[idx]
 
-        # token accuracy
+        # Token accuracy ignores special markers so <start>/<eos> do not inflate the score.
         for j in range(len(gold)):
+            if gold[j] in special_labels or pred[j] in special_labels:
+                continue
             if gold[j] == pred[j]:
                 right_tag += 1
-        all_tag += len(gold)
+            all_tag += 1
 
         if label_type.upper() in ('BMES', 'BIOES'):
             gold_spans = get_ner_BMES(gold)
