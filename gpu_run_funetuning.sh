@@ -14,26 +14,35 @@
 set -euo pipefail
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
-VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/.venv}"
+VENV_PATH="${VENV_PATH:-/home/mh1f25/.conda/envs/odrl_extraction}"
 MODEL_PATH="${DEBERTA_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large}"
 
 cd "$PROJECT_DIR"
 
-if [[ ! -f "$VENV_PATH/bin/activate" ]]; then
-    echo "ERROR: virtual-environment activation script not found: $VENV_PATH/bin/activate" >&2
-    echo "Create it first, or submit with VENV_PATH=/path/to/venv." >&2
+if [[ -f "$VENV_PATH/conda-meta/history" ]]; then
+    CONDA_SH="/iridisfs/ixsoftware/conda/miniconda-py3/etc/profile.d/conda.sh"
+    if [[ ! -f "$CONDA_SH" ]]; then
+        echo "ERROR: Conda initialization script not found: $CONDA_SH" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "$CONDA_SH"
+    conda activate "$VENV_PATH"
+elif [[ -f "$VENV_PATH/bin/activate" ]]; then
+    # shellcheck disable=SC1090
+    source "$VENV_PATH/bin/activate"
+else
+    echo "ERROR: no Conda or Python virtual environment found at: $VENV_PATH" >&2
+    echo "Create it first, or submit with VENV_PATH=/path/to/environment." >&2
     exit 1
 fi
-
-# shellcheck disable=SC1090
-source "$VENV_PATH/bin/activate"
 
 PYTHON_BIN="$VENV_PATH/bin/python"
 ACTIVE_PYTHON="$(command -v python || true)"
 if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "ERROR: virtual-environment Python is not executable on $(hostname): $PYTHON_BIN" >&2
-    echo "The virtual environment may contain a broken Python symlink." >&2
-    echo "Recreate it with a Python installation that is available on A100 compute nodes." >&2
+    echo "The environment may contain a broken Python symlink." >&2
+    echo "On Iridis, use a Conda environment that is accessible from A100 compute nodes." >&2
     exit 1
 fi
 
@@ -68,7 +77,7 @@ mkdir -p save_model
 echo "Job started: $(date --iso-8601=seconds)"
 echo "Host: $(hostname)"
 echo "Project: $PROJECT_DIR"
-echo "Virtual environment: $VIRTUAL_ENV"
+echo "Environment: ${CONDA_PREFIX:-${VIRTUAL_ENV:-$VENV_PATH}}"
 echo "Python: $PYTHON_BIN"
 echo "Model: $MODEL_PATH"
 
