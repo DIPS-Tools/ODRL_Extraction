@@ -64,6 +64,8 @@ echo "Model: $MODEL_PATH"
 
 nvidia-smi
 
+which python
+
 python  main.py \
     --model deberta-v3-large-crf \
     --data_path ./data/ \
