@@ -18,7 +18,7 @@ def main():
 
     # Required
     parser.add_argument("--model", required=True,
-                        help="Model identifier, e.g. 'bert-lstm-crf', 'deberta-crf', or 'deberta-lstm-crf'.")
+                        help="Checkpoint/model identifier, e.g. 'contract-bert-crf' or 'deberta-v3-crf'.")
     parser.add_argument("--data_path", required=True, default="./data/")
     parser.add_argument("--save_dir", required=True, default="./save_models/")
     parser.add_argument("--word_embedding_model_path", required=True)  # e.g., "/home/.../bert-base-cased"
@@ -44,6 +44,12 @@ def main():
     )
     parser.add_argument("--label_type", choices=["BIO", "BIOES"], default="BIO",
                         help="Tagging scheme to use for labels and metrics.")
+    parser.add_argument(
+        "--metrics_type", "--metrics-type",
+        choices=["entity", "token"],
+        default="entity",
+        help="Metric used for validation checkpoint selection and overall test results.",
+    )
     parser.add_argument("--trust_remote_code", action="store_true",
                         help="Pass to HuggingFace loaders when using custom community checkpoints.")
 
@@ -67,6 +73,12 @@ def main():
     parser.add_argument("--rnn_layers", type=int, default=1)
     parser.add_argument("--rnn_dropout", type=float, default=0.1)
     parser.add_argument("--proj_dropout", type=float, default=0.4)
+    parser.add_argument(
+        "--using-lstm", "--using_lstm",
+        dest="using_lstm",
+        action="store_true",
+        help="Insert a BiLSTM between the pretrained encoder and CRF. Omit for encoder + CRF.",
+    )
 
     parser.add_argument("--max_length", type=int, default=400)
 
@@ -225,14 +237,15 @@ if __name__ == "__main__":
 
 
 
+
+
 # ### Run the tagged model API
 #
-#   nohup .venv/bin/python -u app_rule_bias.py \
+# nohup .venv/bin/python -u app_rule_bias.py \
 #     --model contract-bert-lstm-crf \
 #     --data_path ./data/ \
 #     --save_dir ./save_model \
-#     --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts
-#     \
+#     --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-uncased-contracts \
 #     --num_epochs 20 \
 #     --batch_size 16 \
 #     --max_length 400 \
@@ -242,10 +255,11 @@ if __name__ == "__main__":
 #     --rule_bias_alpha 3.0 \
 #     --correct_data_model correct_data_with_agent_gpt-5.6-luna-v2 \
 #     --device cpu \
-#     --do_test \
 #     --host 0.0.0.0 \
-#     --port 5001 \
-#     > fastapi_rule_bias_correct_data_gpt-5.6-luna.log 2>&1 &
+#     --port 5002 \
+#     > fastapi_rule_bias_correct_data_gpt-5.6-luna-v2.log 2>&1 &
+
+
 
 # new dataset:
 # nohup python -u main.py \

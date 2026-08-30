@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ODRL Dataset Visualizer</title>
+  <style>
+    :root {
+      --bg:#0f1220; --panel:#161a2b; --panel2:#0e1230; --ink:#e6e8f0;
+      --muted:#9aa3b2; --accent:#6ea8fe; --border:#253056; --chip:#20253d;
+      --ASSET:#ffd166; --ACTION:#dc3daa; --RULE_TYPE:#6ea8fe;
+      --CONSTRAINT:#ff7b7b; --PURPOSE:#57cc99; --ASSIGNEE:#f79d65; --O:#414a67;
+    }
+    * { box-sizing:border-box }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif }
+    button,input { font:inherit }
+    .wrap { max-width:1500px; margin:28px auto; padding:0 18px }
+    .topbar { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:18px }
+    h1 { margin:0; font-size:23px }
+    h2 { margin:0; font-size:16px }
+    .nav { display:flex; gap:8px; flex-wrap:wrap }
+    .nav a { color:var(--ink); text-decoration:none; border:1px solid #2a3150; border-radius:9px; padding:7px 11px; font-size:13px }
+    .nav a.active { background:var(--accent); color:#0a0e1a; border-color:var(--accent); font-weight:700 }
+    .card { background:var(--panel); border:1px solid #232848; border-radius:14px }
+    .upload-card { padding:16px; margin-bottom:16px }
+    .upload-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px }
+    .upload-box { display:block; background:var(--panel2); border:1px dashed #3b4a7a; border-radius:12px; padding:14px; cursor:pointer }
+    .upload-box:hover { border-color:var(--accent) }
+    .upload-title { display:block; font-weight:700; margin-bottom:3px }
+    .upload-help { display:block; color:var(--muted); font-size:12px; margin-bottom:10px }
+    input[type=file] { display:block; width:100%; color:var(--muted) }
+    input[type=file]::file-selector-button { border:0; border-radius:8px; background:#28335a; color:var(--ink); padding:7px 10px; margin-right:9px; cursor:pointer }
+    .upload-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:14px }
+    button { border:0; border-radius:9px; background:var(--accent); color:#07101f; padding:9px 14px; font-weight:700; cursor:pointer }
+    button.secondary { background:#28335a; color:var(--ink) }
+    button:disabled { opacity:.4; cursor:not-allowed }
+    .status { color:var(--muted); font-size:13px }
+    .status.error { color:#ff9c9c }
+    .viewer { display:none; overflow:hidden }
+    .viewer.visible { display:block }
+    .viewer-toolbar { display:flex; justify-content:space-between; align-items:center; gap:14px; padding:13px 16px; border-bottom:1px solid #232848 }
+    .record-meta { color:var(--muted); font-size:13px }
+    .layout { display:grid; grid-template-columns:minmax(300px, 40%) minmax(430px, 60%); min-height:580px }
+    .text-pane { padding:18px; border-right:1px solid #232848 }
+    .right-pane { display:grid; grid-template-rows:minmax(250px,auto) minmax(300px,1fr) }
+    .right-pane.single { grid-template-rows:1fr }
+    .detail-pane { padding:18px; min-width:0; overflow:auto }
+    .detail-pane + .detail-pane { border-top:1px solid #232848 }
+    .pane-title { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:12px }
+    .source-text { background:var(--panel2); border:1px solid var(--border); border-radius:12px; padding:16px; white-space:pre-wrap; overflow-wrap:anywhere; font-size:17px; line-height:1.7 }
+    .tokens { display:flex; flex-wrap:wrap; gap:9px }
+    .tok { display:flex; flex-direction:column; align-items:center; gap:5px; min-width:44px; max-width:190px; padding:7px 9px; border-radius:11px; background:var(--chip); border:1px solid #2a3150; overflow-wrap:anywhere }
+    .word { font-weight:600 }
+    .label { max-width:180px; padding:2px 7px; border-radius:999px; font-size:10px; overflow-wrap:anywhere; text-align:center }
+    .e-O { background:var(--O); color:#d8dceb }
+    .e-ASSET { background:var(--ASSET); color:#382d00 }
+    .e-ACTION { background:var(--ACTION); color:#210019 }
+    .e-RULE_TYPE { background:var(--RULE_TYPE); color:#041530 }
+    .e-CONSTRAINT { background:var(--CONSTRAINT); color:#3b0000 }
+    .e-PURPOSE { background:var(--PURPOSE); color:#002018 }
+    .e-ASSIGNEE { background:var(--ASSIGNEE); color:#301400 }
+    .rule { background:var(--panel2); border:1px solid var(--border); border-radius:11px; padding:12px; margin-bottom:10px }
+    .rule-id { color:var(--accent); font-weight:700; margin-bottom:8px }
+    .fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px 14px }
+    .field { min-width:0 }
+    .field-name { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.05em }
+    .field-value { white-space:pre-wrap; overflow-wrap:anywhere }
+    details { margin-top:12px }
+    summary { color:var(--muted); cursor:pointer }
+    pre { margin:8px 0 0; padding:12px; background:#090d25; border:1px solid var(--border); border-radius:10px; color:#cbd5f3; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px }
+    .empty { color:var(--muted); border:1px dashed #354064; border-radius:10px; padding:18px; text-align:center }
+    .pager { display:flex; justify-content:center; align-items:center; gap:12px; padding:14px 16px; border-top:1px solid #232848 }
+    .legend { display:flex; flex-wrap:wrap; gap:6px; margin-top:15px }
+    .legend span { border-radius:999px; padding:2px 8px; font-size:10px }
+    @media (max-width:850px) {
+      .upload-grid,.layout { grid-template-columns:1fr }
+      .text-pane { border-right:0; border-bottom:1px solid #232848 }
+      .topbar { align-items:flex-start; flex-direction:column }
+      .fields { grid-template-columns:1fr }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="topbar">
+      <h1>ODRL Dataset Visualizer</h1>
+      <nav class="nav" aria-label="Application pages">
+        <a href="/odrl-ner-label">NER label tester</a>
+        <a class="active" href="/visulize-records">Dataset visualizer</a>
+      </nav>
+    </header>
+
+    <section class="card upload-card" aria-labelledby="upload-heading">
+      <h2 id="upload-heading">Upload one or both dataset files</h2>
+      <p class="status">Files are read in this browser and are not sent to the FastAPI server. Expected format: one JSON object per line.</p>
+      <div class="upload-grid">
+        <label class="upload-box">
+          <span class="upload-title">1. NER tag file</span>
+          <span class="upload-help">Example: train_correct_with_agent_gpt-5.6-luna_flat.txt — each record has “text” and “entities”.</span>
+          <input id="nerFile" type="file" accept=".txt,.jsonl,.json,application/json,text/plain" />
+        </label>
+        <label class="upload-box">
+          <span class="upload-title">2. ODRL file</span>
+          <span class="upload-help">Example: train_odrl_with_agent_gpt-5.6-luna.txt — each record has “text” and an “odrl” array.</span>
+          <input id="odrlFile" type="file" accept=".txt,.jsonl,.json,application/json,text/plain" />
+        </label>
+      </div>
+      <div class="upload-actions">
+        <button id="loadButton" type="button">Load records</button>
+        <button id="clearButton" class="secondary" type="button">Clear</button>
+        <span id="status" class="status" role="status">Choose at least one file.</span>
+      </div>
+    </section>
+
+    <section id="viewer" class="card viewer" aria-live="polite">
+      <div class="viewer-toolbar">
+        <strong id="recordPosition">Record 0 of 0</strong>
+        <span id="recordMeta" class="record-meta"></span>
+      </div>
+      <div class="layout">
+        <section class="text-pane">
+          <div class="pane-title"><h2>Source text</h2></div>
+          <div id="sourceText" class="source-text"></div>
+        </section>
+        <div id="rightPane" class="right-pane">
+          <section id="nerPane" class="detail-pane">
+            <div class="pane-title"><h2>NER tags</h2><span id="entityCount" class="record-meta"></span></div>
+            <div id="nerContent"></div>
+            <div class="legend" aria-label="NER legend">
+              <span class="e-ASSET">ASSET</span><span class="e-ACTION">ACTION</span>
+              <span class="e-RULE_TYPE">RULE_TYPE</span><span class="e-ASSIGNEE">ASSIGNEE</span>
+              <span class="e-CONSTRAINT">CONSTRAINT</span><span class="e-PURPOSE">PURPOSE</span>
+            </div>
+          </section>
+          <section id="odrlPane" class="detail-pane">
+            <div class="pane-title"><h2>ODRL format</h2><span id="ruleCount" class="record-meta"></span></div>
+            <div id="odrlContent"></div>
+          </section>
+        </div>
+      </div>
+      <div class="pager">
+        <button id="previousButton" class="secondary" type="button">Previous</button>
+        <span id="pagePosition" class="record-meta"></span>
+        <button id="nextButton" type="button">Next</button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    'use strict';
+
+    const state = { records: [], index: 0, nerName: '', odrlName: '' };
+    const ids = (name) => document.getElementById(name);
+
+    async function parseDatasetFile(file, kind) {
+      const raw = (await file.text()).replace(/^\uFEFF/, '').trim();
+      if (!raw) throw new Error(`${file.name} is empty.`);
+
+      let rows;
+      if (raw.startsWith('[')) {
+        try { rows = JSON.parse(raw); }
+        catch (error) { throw new Error(`${file.name} is not valid JSON: ${error.message}`); }
+        if (!Array.isArray(rows)) throw new Error(`${file.name} must contain a JSON array or JSONL records.`);
+      } else {
+        rows = raw.split(/\r?\n/).filter(line => line.trim()).map((line, index) => {
+          try { return JSON.parse(line); }
+          catch (error) { throw new Error(`${file.name}, line ${index + 1}: ${error.message}`); }
+        });
+      }
+
+      rows.forEach((row, index) => {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) {
+          throw new Error(`${file.name}, record ${index + 1}: expected a JSON object.`);
+        }
+        if (typeof row.text !== 'string') {
+          throw new Error(`${file.name}, record ${index + 1}: missing string field “text”.`);
+        }
+        if (kind === 'ner' && !Array.isArray(row.entities) && !Array.isArray(row.labels) && !Array.isArray(row.label)) {
+          throw new Error(`${file.name}, record ${index + 1}: expected “entities”, “labels”, or “label”.`);
+        }
+        if (kind === 'odrl' && !Array.isArray(row.odrl) && !Array.isArray(row.rules)) {
+          throw new Error(`${file.name}, record ${index + 1}: expected an “odrl” or “rules” array.`);
+        }
+      });
+      return rows;
+    }
+
+    function alignRecords(nerRows, odrlRows) {
+      if (!nerRows.length) return odrlRows.map(odrl => ({ text: odrl.text, ner: null, odrl }));
+      if (!odrlRows.length) return nerRows.map(ner => ({ text: ner.text, ner, odrl: null }));
+
+      const odrlByText = new Map();
+      odrlRows.forEach((row, index) => {
+        const queue = odrlByText.get(row.text) || [];
+        queue.push({ row, index });
+        odrlByText.set(row.text, queue);
+      });
+      const used = new Set();
+      const aligned = nerRows.map(ner => {
+        const match = (odrlByText.get(ner.text) || []).shift();
+        if (match) used.add(match.index);
+        return { text: ner.text, ner, odrl: match ? match.row : null };
+      });
+      odrlRows.forEach((odrl, index) => {
+        if (!used.has(index)) aligned.push({ text: odrl.text, ner: null, odrl });
+      });
+      return aligned;
+    }
+
+    function tokenize(text) {
+      const tokens = [];
+      const regex = /[\p{L}\p{N}_]+(?:['’][\p{L}\p{N}_]+)*|[^\s]/gu;
+      for (const match of text.matchAll(regex)) {
+        tokens.push({ text: match[0], start: match.index, end: match.index + match[0].length });
+      }
+      return tokens;
+    }
+
+    function safeBaseLabel(label) {
+      const raw = String(label || 'O').replace(/^[BIES]-/, '');
+      if (raw.startsWith('RULE_TYPE')) return 'RULE_TYPE';
+      if (raw.includes('ASSIGNEE')) return 'ASSIGNEE';
+      return ['ASSET','ACTION','CONSTRAINT','PURPOSE','O'].includes(raw) ? raw : 'O';
+    }
+
+    function labelsForRecord(record, tokens) {
+      const supplied = record.labels || record.label;
+      if (Array.isArray(supplied)) return tokens.map((_, index) => supplied[index] || 'O');
+
+      const entities = [...(record.entities || [])]
+        .filter(entity => Number.isInteger(entity.start) && Number.isInteger(entity.end) && entity.end > entity.start)
+        .sort((a, b) => a.start - b.start || a.end - b.end);
+      const firstTokenByEntity = new Map();
+      return tokens.map((token, tokenIndex) => {
+        const entityIndex = entities.findIndex(entity => token.start < entity.end && token.end > entity.start);
+        if (entityIndex < 0) return 'O';
+        const entity = entities[entityIndex];
+        if (!firstTokenByEntity.has(entityIndex)) firstTokenByEntity.set(entityIndex, tokenIndex);
+        const prefix = firstTokenByEntity.get(entityIndex) === tokenIndex ? 'B' : 'I';
+        return `${prefix}-${entity.label}`;
+      });
+    }
+
+    function emptyMessage(message) {
+      const element = document.createElement('div');
+      element.className = 'empty';
+      element.textContent = message;
+      return element;
+    }
+
+    function renderNer(ner, text) {
+      const target = ids('nerContent');
+      target.replaceChildren();
+      if (!ner) {
+        ids('entityCount').textContent = '';
+        target.append(emptyMessage('No matching NER record was uploaded for this text.'));
+        return;
+      }
+      const tokens = tokenize(text);
+      const labels = labelsForRecord(ner, tokens);
+      const container = document.createElement('div');
+      container.className = 'tokens';
+      tokens.forEach((token, index) => {
+        const chip = document.createElement('div');
+        chip.className = 'tok';
+        const word = document.createElement('div');
+        word.className = 'word';
+        word.textContent = token.text;
+        const label = document.createElement('div');
+        label.className = `label e-${safeBaseLabel(labels[index])}`;
+        label.textContent = labels[index];
+        chip.append(word, label);
+        container.append(chip);
+      });
+      target.append(container);
+      ids('entityCount').textContent = Array.isArray(ner.entities)
+        ? `${ner.entities.length} entities` : `${labels.filter(label => label !== 'O').length} tagged tokens`;
+    }
+
+    function renderOdrl(odrl) {
+      const target = ids('odrlContent');
+      target.replaceChildren();
+      if (!odrl) {
+        ids('ruleCount').textContent = '';
+        target.append(emptyMessage('No matching ODRL record was uploaded for this text.'));
+        return;
+      }
+      const rules = odrl.odrl || odrl.rules || [];
+      ids('ruleCount').textContent = `${rules.length} rule${rules.length === 1 ? '' : 's'}`;
+      if (!rules.length) target.append(emptyMessage('This record contains no ODRL rules.'));
+      const fields = ['assignee','action','asset','rule_type','constraint','purpose','attributed_party','source_text'];
+      rules.forEach((rule, index) => {
+        const card = document.createElement('article');
+        card.className = 'rule';
+        const heading = document.createElement('div');
+        heading.className = 'rule-id';
+        heading.textContent = rule.policy_rule_id || `policy-rule-${index + 1}`;
+        const grid = document.createElement('div');
+        grid.className = 'fields';
+        fields.filter(name => name in rule).forEach(name => {
+          const field = document.createElement('div');
+          field.className = 'field';
+          const label = document.createElement('div');
+          label.className = 'field-name';
+          label.textContent = name.replaceAll('_', ' ');
+          const value = document.createElement('div');
+          value.className = 'field-value';
+          value.textContent = rule[name] === '' ? '—' : String(rule[name] ?? '—');
+          field.append(label, value);
+          grid.append(field);
+        });
+        card.append(heading, grid);
+        target.append(card);
+      });
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      summary.textContent = 'Show raw ODRL JSON';
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(odrl, null, 2);
+      details.append(summary, pre);
+      target.append(details);
+    }
+
+    function renderCurrent() {
+      if (!state.records.length) return;
+      const record = state.records[state.index];
+      const position = `${state.index + 1} of ${state.records.length}`;
+      ids('recordPosition').textContent = `Record ${position}`;
+      ids('pagePosition').textContent = position;
+      ids('sourceText').textContent = record.text;
+      const availability = [record.ner ? 'NER' : null, record.odrl ? 'ODRL' : null].filter(Boolean).join(' + ');
+      ids('recordMeta').textContent = availability || 'No aligned data';
+      renderNer(record.ner, record.text);
+      renderOdrl(record.odrl);
+      ids('previousButton').disabled = state.index === 0;
+      ids('nextButton').disabled = state.index === state.records.length - 1;
+    }
+
+    function setStatus(message, isError = false) {
+      ids('status').textContent = message;
+      ids('status').className = `status${isError ? ' error' : ''}`;
+    }
+
+    ids('loadButton').addEventListener('click', async () => {
+      const nerFile = ids('nerFile').files[0];
+      const odrlFile = ids('odrlFile').files[0];
+      if (!nerFile && !odrlFile) return setStatus('Choose an NER file, an ODRL file, or both.', true);
+      ids('loadButton').disabled = true;
+      setStatus('Reading and validating files…');
+      try {
+        const [nerRows, odrlRows] = await Promise.all([
+          nerFile ? parseDatasetFile(nerFile, 'ner') : Promise.resolve([]),
+          odrlFile ? parseDatasetFile(odrlFile, 'odrl') : Promise.resolve([])
+        ]);
+        state.records = alignRecords(nerRows, odrlRows);
+        state.index = 0;
+        state.nerName = nerFile ? nerFile.name : '';
+        state.odrlName = odrlFile ? odrlFile.name : '';
+        ids('nerPane').hidden = !nerFile;
+        ids('odrlPane').hidden = !odrlFile;
+        ids('rightPane').classList.toggle('single', !nerFile || !odrlFile);
+        const paired = state.records.filter(row => row.ner && row.odrl).length;
+        const detail = nerRows.length && odrlRows.length ? `; ${paired} paired by exact text` : '';
+        setStatus(`Loaded ${state.records.length} record(s)${detail}.`);
+        ids('viewer').classList.add('visible');
+        renderCurrent();
+      } catch (error) {
+        state.records = [];
+        ids('viewer').classList.remove('visible');
+        setStatus(error.message, true);
+      } finally {
+        ids('loadButton').disabled = false;
+      }
+    });
+
+    ids('clearButton').addEventListener('click', () => {
+      ids('nerFile').value = '';
+      ids('odrlFile').value = '';
+      state.records = [];
+      state.index = 0;
+      ids('nerPane').hidden = false;
+      ids('odrlPane').hidden = false;
+      ids('rightPane').classList.remove('single');
+      ids('viewer').classList.remove('visible');
+      setStatus('Choose at least one file.');
+    });
+    ids('previousButton').addEventListener('click', () => { if (state.index > 0) { state.index--; renderCurrent(); } });
+    ids('nextButton').addEventListener('click', () => { if (state.index + 1 < state.records.length) { state.index++; renderCurrent(); } });
+    document.addEventListener('keydown', event => {
+      if (!state.records.length || event.target.matches('input,textarea')) return;
+      if (event.key === 'ArrowLeft') ids('previousButton').click();
+      if (event.key === 'ArrowRight') ids('nextButton').click();
+    });
+  </script>
+</body>
+</html>

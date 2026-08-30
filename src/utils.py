@@ -261,6 +261,54 @@ def get_ner_fmeasure(golden_lists, predict_lists, label_type='BIO'):
     return accuracy, precision, recall, f_measure
 
 
+def get_token_fmeasure(golden_lists, predict_lists):
+    """Return token accuracy and micro P/R/F1 for non-O NER tags.
+
+    Accuracy includes ordinary ``O`` tokens but excludes sequence-control
+    labels. Precision, recall, and F1 treat every BIO/BIOES tag as a distinct
+    class and micro-average over non-O tags.
+    """
+    special_labels = {'<pad>', '<start>', '<eos>'}
+    correct = total = true_positive = false_positive = false_negative = 0
+
+    for gold_sequence, pred_sequence in zip(golden_lists, predict_lists):
+        for gold, pred in zip(gold_sequence, pred_sequence):
+            if gold in special_labels:
+                continue
+            total += 1
+            if gold == pred:
+                correct += 1
+                if gold != 'O' and gold not in special_labels:
+                    true_positive += 1
+                continue
+            if pred != 'O' and pred not in special_labels:
+                false_positive += 1
+            if gold != 'O':
+                false_negative += 1
+
+    accuracy = correct / total if total else 0.0
+    precision = (
+        true_positive / (true_positive + false_positive)
+        if true_positive + false_positive else 0.0
+    )
+    recall = (
+        true_positive / (true_positive + false_negative)
+        if true_positive + false_negative else 0.0
+    )
+    f_measure = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall else 0.0
+    )
+    return accuracy, precision, recall, f_measure
+
+
+def get_selected_fmeasure(golden_lists, predict_lists, metrics_type='entity', label_type='BIO'):
+    """Calculate the configured overall metric while keeping one call site."""
+    if str(metrics_type).lower() == 'token':
+        return get_token_fmeasure(golden_lists, predict_lists)
+    return get_ner_fmeasure(golden_lists, predict_lists, label_type=label_type)
+
+
 
 # metrics_per_tag_and_type.py
 import pandas as pd
@@ -448,6 +496,10 @@ def compute_token_metrics_by_tag(gold_seqs, pred_seqs, label_list):
             g_seq = g_seq[:min_len]
             p_seq = p_seq[:min_len]
         for g, p in zip(g_seq, p_seq):
+            if g in {'<pad>', '<start>', '<eos>'}:
+                continue
+            if p in {'<pad>', '<start>', '<eos>'}:
+                p = 'O'
             if g not in counts: counts[g] = {"tp":0,"fp":0,"fn":0,"gold":0,"pred":0}
             if p not in counts: counts[p] = {"tp":0,"fp":0,"fn":0,"gold":0,"pred":0}
             counts[g]["gold"] += 1

@@ -12,7 +12,7 @@ from .utils import (
     InputFeatures,
     compute_entity_metrics_by_type,
     compute_token_metrics_by_tag,
-    get_ner_fmeasure,
+    get_selected_fmeasure,
     recover_label,
 )
 
@@ -157,12 +157,15 @@ def run_test(
     per_type_df.to_csv(result_prefix + "_metrics_per_type.csv", index=False)
     per_tag_df.to_csv(result_prefix + "_metrics_per_tag.csv", index=False)
 
-    accuracy, precision, recall, f1 = get_ner_fmeasure(
+    metrics_type = getattr(cfg, "metrics_type", "entity")
+    accuracy, precision, recall, f1 = get_selected_fmeasure(
         gold_labels,
         pred_labels,
+        metrics_type=metrics_type,
         label_type=cfg.label_type,
     )
     metrics_df = pd.DataFrame([{
+        "metrics_type": metrics_type,
         "prediction_strategy": "rule_bias",
         "rule_bias_alpha": alpha,
         "post_rules": apply_post_rules,

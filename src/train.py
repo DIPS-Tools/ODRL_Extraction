@@ -6,7 +6,7 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from .hybrid_extraction_rules import apply_rules_to_predictions, decode_with_rule_bias
-from .utils import recover_label, get_ner_fmeasure
+from .utils import recover_label, get_selected_fmeasure
 
 
 def _to_device(x, device):
@@ -87,7 +87,12 @@ def evaluate(model, cfg, dev_loader, dev_features):
     # if dev_features is not None:
     #     pred_label = apply_rules_to_predictions(pred_label, dev_features)
 
-    acc, p, r, f = get_ner_fmeasure(gold_label, pred_label, label_type=getattr(cfg, "label_type", "BIO"))
+    acc, p, r, f = get_selected_fmeasure(
+        gold_label,
+        pred_label,
+        metrics_type=getattr(cfg, "metrics_type", "entity"),
+        label_type=getattr(cfg, "label_type", "BIO"),
+    )
 
 
     model.train()
@@ -199,7 +204,10 @@ def run_train(model, cfg, train_dataloader, dev_dataloader, dev_features):
     # best_path = os.path.join(cfg.save_path, "_best_f1.pth")
     # last_path = os.path.join(cfg.save_path, "_last_model.pth")
 
-    print(f"[train] device={device} | epochs={num_epochs} | use_scheduler={use_scheduler} | AMP={use_amp}")
+    print(
+        f"[train] device={device} | epochs={num_epochs} | "
+        f"metrics_type={cfg.metrics_type} | use_scheduler={use_scheduler} | AMP={use_amp}"
+    )
     print(f"[train] save_dir={save_dir}\n       best -> {best_path}\n       last -> {last_path}")
 
     best_f1 = -1.0
@@ -244,7 +252,10 @@ def run_train(model, cfg, train_dataloader, dev_dataloader, dev_features):
 
         # --- dev eval
         acc, p, r, f = evaluate(model, cfg, dev_dataloader, dev_features)
-        print(f"[epoch {epoch+1}] dev  acc={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f:.4f}")
+        print(
+            f"[epoch {epoch+1}] dev {cfg.metrics_type}  acc={acc:.4f}  "
+            f"P={p:.4f}  R={r:.4f}  F1={f:.4f}"
+        )
 
         # --- save best & last
         if f > best_f1:
@@ -254,4 +265,4 @@ def run_train(model, cfg, train_dataloader, dev_dataloader, dev_features):
 
         torch.save(model.state_dict(), last_path)
 
-    print(f"Training finished. Best F1={best_f1:.4f}.")
+    print(f"Training finished. Best {cfg.metrics_type} F1={best_f1:.4f}.")

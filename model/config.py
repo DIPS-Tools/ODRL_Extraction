@@ -8,6 +8,7 @@ from transformers import AutoTokenizer, AutoConfig
 from model.bert_idcnn_crf import BERT_IDCNN_CRF
 from model.bert_lstm_crf import BERT_LSTM_CRF
 from model.deberta_crf import DeBERTa_CRF
+from model.hf_crf import HF_CRF
 from model.hf_lstm_crf import HF_LSTM_CRF
 
 
@@ -86,6 +87,11 @@ class Config(object):
         self.label_type = getattr(args, "label_type", "BIO").upper()
         if self.label_type not in {"BIO", "BIOES"}:
             raise ValueError(f"Unsupported label_type {self.label_type}. Choose 'BIO' or 'BIOES'.")
+        self.metrics_type = getattr(args, "metrics_type", "entity").lower()
+        if self.metrics_type not in {"entity", "token"}:
+            raise ValueError(
+                f"Unsupported metrics_type {self.metrics_type}. Choose 'entity' or 'token'."
+            )
 
         # Device
         self.device = torch.device(getattr(args, "device", ("cuda" if torch.cuda.is_available() else "cpu")))
@@ -135,6 +141,7 @@ class Config(object):
         self.rnn_layers      = getattr(args, "rnn_layers", 1)
         self.rnn_dropout     = getattr(args, "rnn_dropout", 0.1)   # LSTM internal dropout (between layers)
         self.proj_dropout    = getattr(args, "proj_dropout", 0.4)  # Dropout before linear head
+        self.using_lstm      = bool(getattr(args, "using_lstm", False))
 
         self.use_scheduler    = getattr(args, "use_scheduler", False)
 
@@ -227,12 +234,14 @@ class Config(object):
                   f"_lr{self.learning_rate}_lt{self.label_type}")
         if self.flag == "bert-idcnn-crf":
             suffix += f"_kernel{self.kernel_size}_num_block{self.num_block}"
-        elif self.flag == "bert-lstm-crf":
+        elif self.using_lstm:
             suffix += f"_num_layers{self.rnn_layers}"
         else:
-            suffix += f"_num_layers{self.rnn_layers}"
+            suffix += "_direct_crf"
         if self.data_tag:
             suffix += f"_{self.data_tag}"
+        if self.metrics_type == "token":
+            suffix += "_metric_token"
         self.save_path = os.path.join(self.save_dir, suffix)
 
 
@@ -249,6 +258,8 @@ class Config(object):
         Also resizes token embeddings if tokenizer size changed (e.g., added PAD for GPT-2).
         """
         if self.flag == "bert-idcnn-crf":
+            if self.using_lstm:
+                raise ValueError("--using-lstm cannot be combined with bert-idcnn-crf.")
             model = BERT_IDCNN_CRF(
                 vocab_size=self.tokenizer.vocab_size,         # kept for API compatibility
                 tagset_size=self.tagset_size,
@@ -261,7 +272,7 @@ class Config(object):
                 use_cuda=self.use_cuda,
                 bert_model_name_or_path=self.word_embedding_model_path,
             )
-        elif self.flag == "bert-lstm-crf":
+        elif self.using_lstm and self.flag == "bert-lstm-crf":
             model = BERT_LSTM_CRF(
                 bert_config=self.word_embedding_model_path,   # path or HF id
                 tagset_size=self.tagset_size,
@@ -273,13 +284,7 @@ class Config(object):
                 use_cuda=self.use_cuda,
             )
 
-        elif self.flag == "deberta-crf":
-            model = DeBERTa_CRF(
-                deberta_model_name_or_path=self.word_embedding_model_path,
-                tagset_size=self.tagset_size,
-                use_cuda= self.use_cuda,
-            )
-        elif self.flag.endswith("-lstm-crf"):
+        elif self.using_lstm:
             model = HF_LSTM_CRF(
                 encoder_name_or_path=self.word_embedding_model_path,
                 tagset_size=self.tagset_size,
@@ -291,9 +296,12 @@ class Config(object):
                 trust_remote_code=self.trust_remote_code,
             )
         else:
-            raise ValueError(
-                f"Unknown model flag: {self.flag}. "
-                "Supported: 'bert-idcnn-crf', 'bert-lstm-crf', 'deberta-crf', or any '<name>-lstm-crf' combination."
+            model = HF_CRF(
+                encoder_name_or_path=self.word_embedding_model_path,
+                tagset_size=self.tagset_size,
+                dropout_rate=self.proj_dropout,
+                use_cuda=self.use_cuda,
+                trust_remote_code=self.trust_remote_code,
             )
 
         # Put on device

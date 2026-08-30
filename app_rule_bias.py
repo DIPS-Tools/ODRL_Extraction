@@ -9,6 +9,7 @@ from typing import List, Optional
 import torch
 import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
@@ -249,6 +250,12 @@ def build_parser():
     )
     parser.add_argument("--label_type", choices=["BIO", "BIOES"], default="BIO",
                         help="Tagging scheme to use for labels.")
+    parser.add_argument(
+        "--metrics_type", "--metrics-type",
+        choices=["entity", "token"],
+        default="entity",
+        help="Metric used to select the checkpoint during training.",
+    )
     parser.add_argument("--trust_remote_code", action="store_true")
 
     # Training settings
@@ -271,6 +278,12 @@ def build_parser():
     parser.add_argument("--rnn_layers", type=int, default=2)
     parser.add_argument("--rnn_dropout", type=float, default=0.1)
     parser.add_argument("--proj_dropout", type=float, default=0.4)
+    parser.add_argument(
+        "--using-lstm", "--using_lstm",
+        dest="using_lstm",
+        action="store_true",
+        help="Load an encoder + BiLSTM + CRF checkpoint. Omit for encoder + CRF.",
+    )
 
 
     parser.add_argument("--max_length", type=int, default=400)
@@ -298,15 +311,21 @@ def build_parser():
 
 
 @app.get('/')
-def index(request: Request):
+def index():
+    return RedirectResponse(url='/odrl-ner-label', status_code=307)
+
+
+@app.get('/odrl-ner-label')
+def odrl_ner_label_page(request: Request):
     return templates.TemplateResponse(
         request=request,
-        name='index.html',
+        name='odrl-ner-label.html',
         context={'question': None, 'result': None},
     )
 
 
 @app.post('/')
+@app.post('/odrl-ner-label')
 def predict(request: Request, text: str = Form(...)):
     if config is None or model is None:
         raise RuntimeError(
@@ -317,9 +336,23 @@ def predict(request: Request, text: str = Form(...)):
     result = query_test(model, config, text)
     return templates.TemplateResponse(
         request=request,
-        name='index.html',
+        name='odrl-ner-label.html',
         context={'question': text, 'result': result},
     )
+
+
+@app.get('/visulize-records')
+def visulize_records(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name='visulize-records.html',
+        context={},
+    )
+
+
+@app.get('/visualize-records')
+def visualize_records_alias():
+    return RedirectResponse(url='/visulize-records', status_code=307)
 
 
 @app.post('/odrl_generation', response_model=ODRLGenerationResponse)

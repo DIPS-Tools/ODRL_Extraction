@@ -11,7 +11,7 @@ from .utils import compute_entity_metrics_by_type, compute_token_metrics_by_tag
 from .utils import compute_entity_metrics_by_type_bioes
 from .utils import heuristic_postprocess_purpose_constraint
 # adjust imports to where you defined them
-from .utils import recover_label, get_ner_fmeasure, InputFeatures
+from .utils import recover_label, get_selected_fmeasure, InputFeatures
 
 
 def _device_from_cfg(cfg):
@@ -120,8 +120,15 @@ def run_test(
     #     pred_label = refined_pred_label
     #
     # Metrics (per selected label scheme)
-    acc, p, r, f = get_ner_fmeasure(gold_label, pred_label, label_type=cfg.label_type)
+    metrics_type = getattr(cfg, "metrics_type", "entity")
+    acc, p, r, f = get_selected_fmeasure(
+        gold_label,
+        pred_label,
+        metrics_type=metrics_type,
+        label_type=cfg.label_type,
+    )
     metrics_df = pd.DataFrame([{
+        "metrics_type": metrics_type,
         "num_sentences": len(gold_label),
         "accuracy": acc,
         "precision": p,
