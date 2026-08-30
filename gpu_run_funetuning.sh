@@ -63,9 +63,10 @@ echo "Python: $PYTHON_BIN"
 echo "Model: $MODEL_PATH"
 
 nvidia-smi
-python -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
 
-python -u main.py \
+#python -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
+
+python main.py \
     --model deberta-v3-large-crf \
     --data_path ./data/ \
     --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
