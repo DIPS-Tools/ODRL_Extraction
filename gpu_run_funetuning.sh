@@ -1,39 +1,107 @@
 #!/bin/bash
 #SBATCH --mail-user=miao.hu@soton.ac.uk
-#SBATCH --mail-type=BEGIN
-#SBATCH --mail-type=END
-#SBATCH --mail-type=FAIL
-#!SBATCH --mem=80G
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mem=80G
 #SBATCH --nodes=1
-#SBATCH --ntasks=16
-#SBATCH -p a100
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 #SBATCH --time=60:00:00
-#SBATCH --job-name=odrl_extraction
-#SBATCH --output=./result_out/roberta-%j.out
+#SBATCH --job-name=odrl_deberta_v3_large
+#SBATCH --output=./result_out/main_deberta-v3-large_crf_correct_data_gpt-5.6-luna-v2-%j.out
+
+set -euo pipefail
 
 module add nvidia-cuda
+
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
+VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/.venv}"
+MODEL_PATH="${DEBERTA_MODEL_PATH:-/home/mh1f25/scratch/llms_model/deberta-v3-large}"
+
+cd "$PROJECT_DIR"
+
+if [[ ! -x "$VENV_PATH/bin/python" ]]; then
+    echo "ERROR: virtual-environment Python not found: $VENV_PATH/bin/python" >&2
+    echo "Create it first, or submit with VENV_PATH=/path/to/venv." >&2
+    exit 1
+fi
+
+if [[ ! -d "$MODEL_PATH" ]]; then
+    echo "ERROR: DeBERTa model directory not found: $MODEL_PATH" >&2
+    echo "Copy/download it first, or submit with DEBERTA_MODEL_PATH=/path/to/model." >&2
+    exit 1
+fi
+
+for DATA_FILE in \
+    data/train_correct_with_agent_gpt-5.6-luna_flat.txt \
+    data/valid_correct_with_agent_gpt-5.6-luna_flat.txt \
+    data/test_correct_with_agent_gpt-5.6-luna_flat.txt
+do
+    if [[ ! -f "$DATA_FILE" ]]; then
+        echo "ERROR: dataset file not found: $DATA_FILE" >&2
+        exit 1
+    fi
+done
+
+mkdir -p save_model
+
+echo "Job started: $(date --iso-8601=seconds)"
+echo "Host: $(hostname)"
+echo "Project: $PROJECT_DIR"
+echo "Python: $VENV_PATH/bin/python"
+echo "Model: $MODEL_PATH"
+
 nvidia-smi
+"$VENV_PATH/bin/python" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
 
-echo "the job start "
+"$VENV_PATH/bin/python" -u main.py \
+    --model deberta-v3-large-crf \
+    --data_path ./data/ \
+    --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
+    --valid_file valid_correct_with_agent_gpt-5.6-luna_flat.txt \
+    --test_file test_correct_with_agent_gpt-5.6-luna_flat.txt \
+    --data_tag correct_data_with_agent_gpt-5.6-luna-v2 \
+    --save_dir ./save_model \
+    --word_embedding_model_path "$MODEL_PATH" \
+    --num_epochs 20 \
+    --batch_size 8 \
+    --max_length 400 \
+    --learning_rate 2e-5 \
+    --label_type BIO \
+    --metrics_type entity \
+    --proj_dropout 0.1 \
+    --device cuda \
+    --do_train \
+    --do_test
 
-# CUDA_VISIBLE_DEVICES="0,1" python -m torch.distributed.launch --nproc_per_node 2
-#python main.py --model bert-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-cased  --do_train --do_test  --num_epochs  20  --rnn_layers 5
-
-python main.py --model roberta-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/roberta-large  --do_train --do_test  --num_epochs  20   --rnn_layers 5
-
-
-#python main.py --model bert-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/bert-base-cased  --do_train --do_test  --num_epochs 3
-#python main.py --model t5-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/t5-base  --do_train --do_test  --num_epochs 3
-#python main.py --model llama-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/Llama-3.2-1B  --do_train --do_test  --num_epochs 3
-#python main.py --model mixtral-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/Mistral7B  --do_train --do_test  --num_epochs 3
-
-#python main.py --model deberta-lstm-crf  --data_path ./data/ --save_dir ./save_model --word_embedding_model_path /home/mh1f25/scratch/llms_model/deberta-v3-base  --do_train --do_test  --num_epochs  20
-
-
-
-echo "the job end "
+echo "Job finished: $(date --iso-8601=seconds)"
 
 
 
 
+# mkdir -p result_out save_model
+ #  sbatch gpu_run_funetuning.sh
+ #
+ #  Although each node has two GPUs, request only one. The current training code is single-GPU and does
+ #  not use distributed training; requesting two would waste the second GPU.
+ #
+ #  An A100 80GB should comfortably handle:
+ #
+ #  DeBERTa-v3-large + CRF
+ #  max_length=400
+ #  batch_size=8
+ #  mixed-precision training
+ #
+ #  You could potentially increase batch size to 16, but start with 8 to establish a reliable baseline.
+ #  Check memory during training with:
+ #
+ #  watch -n 2 nvidia-smi
+ #
+ #  My partition ranking for this experiment is:
+ #
+ #  1. a100 — recommended, non-preemptible, up to 60 hours.
+ #  2. dual_h200 or quad_h200 — potentially faster, but unnecessary for this dataset.
+ #  3. scavenger_4a100 — only for short experiments; 12-hour limit and preemption risk.
+ #  4. scavenger_8h100 — fast but also preemptible and limited to 12 hours.
+ #  5. Private swarm_a100/swarm_h100 — only if you are eligible.
