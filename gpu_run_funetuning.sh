@@ -28,11 +28,21 @@ fi
 # shellcheck disable=SC1090
 source "$VENV_PATH/bin/activate"
 
-PYTHON_BIN="$(command -v python || true)"
-if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
-    echo "ERROR: no executable Python was found after activating $VENV_PATH" >&2
+PYTHON_BIN="$VENV_PATH/bin/python"
+ACTIVE_PYTHON="$(command -v python || true)"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "ERROR: virtual-environment Python is not executable on $(hostname): $PYTHON_BIN" >&2
     echo "The virtual environment may contain a broken Python symlink." >&2
     echo "Recreate it with a Python installation that is available on A100 compute nodes." >&2
+    exit 1
+fi
+
+if [[ "$ACTIVE_PYTHON" != "$PYTHON_BIN" ]]; then
+    echo "ERROR: activating $VENV_PATH selected the wrong Python interpreter." >&2
+    echo "Expected: $PYTHON_BIN" >&2
+    echo "Actual:   ${ACTIVE_PYTHON:-not found}" >&2
+    echo "The virtual environment was probably moved or copied after it was created." >&2
+    echo "Recreate .venv at its current project path." >&2
     exit 1
 fi
 
@@ -53,7 +63,7 @@ do
     fi
 done
 
-#mkdir -p save_model
+mkdir -p save_model
 
 echo "Job started: $(date --iso-8601=seconds)"
 echo "Host: $(hostname)"
@@ -64,12 +74,9 @@ echo "Model: $MODEL_PATH"
 
 nvidia-smi
 
-# shellcheck disable=SC1090
-source .venv/bin/activate
+"$PYTHON_BIN" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
 
-which python
-
-python  main.py \
+"$PYTHON_BIN" -u main.py \
     --model deberta-v3-large-crf \
     --data_path ./data/ \
     --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
