@@ -53,7 +53,7 @@ do
     fi
 done
 
-mkdir -p save_model
+#mkdir -p save_model
 
 echo "Job started: $(date --iso-8601=seconds)"
 echo "Host: $(hostname)"
@@ -63,6 +63,9 @@ echo "Python: $PYTHON_BIN"
 echo "Model: $MODEL_PATH"
 
 nvidia-smi
+
+# shellcheck disable=SC1090
+source .venv/bin/activate
 
 which python
 
