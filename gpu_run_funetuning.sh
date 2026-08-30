@@ -13,11 +13,13 @@
 
 set -euo pipefail
 
-module add nvidia-cuda
+if command -v module >/dev/null 2>&1; then
+    module add nvidia-cuda || echo "WARNING: nvidia-cuda module could not be loaded; continuing with the PyTorch CUDA runtime."
+fi
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/.venv}"
-MODEL_PATH="${DEBERTA_MODEL_PATH:-/home/mh1f25/scratch/llms_model/deberta-v3-large}"
+MODEL_PATH="${DEBERTA_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large}"
 
 cd "$PROJECT_DIR"
 
@@ -105,3 +107,31 @@ echo "Job finished: $(date --iso-8601=seconds)"
  #  3. scavenger_4a100 — only for short experiments; 12-hour limit and preemption risk.
  #  4. scavenger_8h100 — fast but also preemptible and limited to 12 hours.
  #  5. Private swarm_a100/swarm_h100 — only if you are eligible.
+#  ST = PD
+  #
+  #  PD means Slurm has not allocated an A100 yet. (None) means no specific blocking reason
+  #  is currently reported; it may simply be waiting for the scheduler’s next allocation
+  #  cycle.
+  #
+  #  Check full details:
+  #
+  #  scontrol show job 1477910
+  #
+  #  Show the pending reason more clearly:
+  #
+  #  squeue -j 1477910 -o "%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R"
+  #
+  #  Check priority:
+  #
+  #  sprio -j 1477910
+  #
+  #  Monitor it:
+  #
+  #  watch -n 10 'squeue -j 1477910'
+  #
+  #  When it starts, ST changes from PD to R, and a node such as rose02 will appear. Then
+  #  monitor the output:
+  #
+  #  tail -f result_out/main_deberta-v3-large_crf_correct_data_gpt-5.6-luna-v2-1477910.out
+  #
+  #  There is no need to resubmit or cancel it at this point.
