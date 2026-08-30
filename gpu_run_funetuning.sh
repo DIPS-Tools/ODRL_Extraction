@@ -8,14 +8,16 @@
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 #SBATCH --time=60:00:00
-#SBATCH --job-name=odrl_roberta_large
-#SBATCH --output=./result_out/main_roberta-large_crf_correct_data_gpt-5.6-luna-v2-%j.out
+#SBATCH --job-name=odrl_modernbert_large
+#SBATCH --output=./result_out/main_modernbert-large_crf_correct_data_gpt-5.6-luna-v2-%j.out
 
 set -euo pipefail
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 VENV_PATH="${VENV_PATH:-/home/mh1f25/.conda/envs/odrl_extraction}"
-MODEL_PATH="${ROBERTA_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/roberta-large}"
+#MODEL_PATH="${MODERNBERT_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large}"
+#MODEL_PATH="${MODERNBERT_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/RoBERTa-large}"
+MODEL_PATH="${MODERNBERT_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/ModernBERT-large}"
 
 cd "$PROJECT_DIR"
 
@@ -56,8 +58,8 @@ if [[ "$ACTIVE_PYTHON" != "$PYTHON_BIN" ]]; then
 fi
 
 if [[ ! -d "$MODEL_PATH" ]]; then
-    echo "ERROR: RoBERTa model directory not found: $MODEL_PATH" >&2
-    echo "Copy/download it first, or submit with ROBERTA_MODEL_PATH=/path/to/model." >&2
+    echo "ERROR: ModernBERT model directory not found: $MODEL_PATH" >&2
+    echo "Copy/download it first, or submit with MODERNBERT_MODEL_PATH=/path/to/model." >&2
     exit 1
 fi
 
@@ -106,8 +108,29 @@ nvidia-smi
 #     --do_train \
 #     --do_test
 
+# Previous RoBERTa-large + CRF experiment:
+# "$PYTHON_BIN" -u main.py \
+#     --model roberta-large-crf \
+#     --data_path ./data/ \
+#     --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
+#     --valid_file valid_correct_with_agent_gpt-5.6-luna_flat.txt \
+#     --test_file test_correct_with_agent_gpt-5.6-luna_flat.txt \
+#     --data_tag correct_data_with_agent_gpt-5.6-luna-v2 \
+#     --save_dir ./save_model \
+#     --word_embedding_model_path /iridisfs/scratch/mh1f25/llms_model/roberta-large \
+#     --num_epochs 20 \
+#     --batch_size 8 \
+#     --max_length 400 \
+#     --learning_rate 2e-5 \
+#     --label_type BIO \
+#     --metrics_type entity \
+#     --proj_dropout 0.1 \
+#     --device cuda \
+#     --do_train \
+#     --do_test
+
 "$PYTHON_BIN" -u main.py \
-    --model roberta-large-crf \
+    --model modernbert-large-crf \
     --data_path ./data/ \
     --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
     --valid_file valid_correct_with_agent_gpt-5.6-luna_flat.txt \
