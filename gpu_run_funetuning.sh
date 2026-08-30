@@ -96,9 +96,9 @@ nvidia-smi
     --word_embedding_model_path "$MODEL_PATH" \
     --num_epochs 20 \
     --batch_size 8 \
-    --max_length 400 \
+    --max_length 512 \
     --learning_rate 2e-5 \
-    --label_type BIO \
+    --label_type BIOES \
     --metrics_type entity \
     --proj_dropout 0.1 \
     --device cuda \
