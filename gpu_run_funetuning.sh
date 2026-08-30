@@ -13,19 +13,26 @@
 
 set -euo pipefail
 
-if command -v module >/dev/null 2>&1; then
-    module add nvidia-cuda || echo "WARNING: nvidia-cuda module could not be loaded; continuing with the PyTorch CUDA runtime."
-fi
-
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 VENV_PATH="${VENV_PATH:-${PROJECT_DIR}/.venv}"
 MODEL_PATH="${DEBERTA_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large}"
 
 cd "$PROJECT_DIR"
 
-if [[ ! -x "$VENV_PATH/bin/python" ]]; then
-    echo "ERROR: virtual-environment Python not found: $VENV_PATH/bin/python" >&2
+if [[ ! -f "$VENV_PATH/bin/activate" ]]; then
+    echo "ERROR: virtual-environment activation script not found: $VENV_PATH/bin/activate" >&2
     echo "Create it first, or submit with VENV_PATH=/path/to/venv." >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$VENV_PATH/bin/activate"
+
+PYTHON_BIN="$(command -v python || true)"
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+    echo "ERROR: no executable Python was found after activating $VENV_PATH" >&2
+    echo "The virtual environment may contain a broken Python symlink." >&2
+    echo "Recreate it with a Python installation that is available on A100 compute nodes." >&2
     exit 1
 fi
 
@@ -51,13 +58,14 @@ mkdir -p save_model
 echo "Job started: $(date --iso-8601=seconds)"
 echo "Host: $(hostname)"
 echo "Project: $PROJECT_DIR"
-echo "Python: $VENV_PATH/bin/python"
+echo "Virtual environment: $VIRTUAL_ENV"
+echo "Python: $PYTHON_BIN"
 echo "Model: $MODEL_PATH"
 
 nvidia-smi
-"$VENV_PATH/bin/python" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
+python -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
 
-"$VENV_PATH/bin/python" -u main.py \
+python -u main.py \
     --model deberta-v3-large-crf \
     --data_path ./data/ \
     --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
