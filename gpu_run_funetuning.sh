@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=60:00:00
 #SBATCH --job-name=odrl_deberta_v3_large
-#SBATCH --output=./result_out/main_deberta-v3-large_crf_correct_data_gpt-5.6-luna-v2-%j.out
+#SBATCH --output=./result_out/main_deberta-v3-large_seq512_ltBIOES_crf_correct_data_gpt-5.6-luna-v2-%j.out
 
 set -euo pipefail
 
