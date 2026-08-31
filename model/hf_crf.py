@@ -87,4 +87,17 @@ class HF_CRF(nn.Module):
         emissions = self.get_output_score(sentence, attention_mask=mask)
         # Long CRF recurrences are numerically fragile in FP16/BF16.
         loss_value = self.crf.neg_log_likelihood_loss(emissions.float(), mask, tags)
+        if not torch.isfinite(loss_value).item():
+            finite_emissions = torch.isfinite(emissions)
+            nonfinite_count = int((~finite_emissions).sum().item())
+            if nonfinite_count:
+                raise FloatingPointError(
+                    "CRF received non-finite encoder/classifier emissions: "
+                    f"{nonfinite_count}/{emissions.numel()} values are NaN or Inf; "
+                    f"emission_dtype={emissions.dtype}."
+                )
+            raise FloatingPointError(
+                "CRF loss became non-finite even though all encoder/classifier "
+                f"emissions were finite; emission_dtype={emissions.dtype}."
+            )
         return loss_value / float(emissions.size(0))

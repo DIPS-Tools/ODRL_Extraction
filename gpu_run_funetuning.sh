@@ -149,7 +149,7 @@ nvidia-smi
     --learning_rate 2e-5 \
     --label_type BIO \
     --metrics_type entity \
-    --amp_dtype bfloat16 \
+    --amp_dtype float32 \
     --proj_dropout 0.1 \
     --device cuda \
     --do_train \
