@@ -19,6 +19,37 @@ def _device_from_cfg(cfg):
     return torch.device(str(cfg.device))
 
 
+def _model_type(model):
+    for attr in ("encoder", "word_embeds", "bert", "deberta"):
+        backbone = getattr(model, attr, None)
+        config = getattr(backbone, "config", None)
+        if config is not None:
+            return str(getattr(config, "model_type", "")).lower()
+    return ""
+
+
+def _resolve_amp_dtype(model, cfg, device):
+    """Return (AMP enabled, autocast dtype, GradScaler enabled)."""
+    requested = str(getattr(cfg, "amp_dtype", "auto")).lower()
+    cuda_training = torch.cuda.is_available() and str(device).startswith("cuda")
+    if not cuda_training or requested == "float32" or not getattr(cfg, "use_amp", True):
+        return False, torch.float32, False
+
+    if requested == "auto":
+        requested = "bfloat16" if _model_type(model) == "modernbert" else "float16"
+
+    if requested == "bfloat16":
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "--amp_dtype bfloat16 was requested, but this GPU/PyTorch build "
+                "does not support CUDA BF16. Use --amp_dtype float16 or float32."
+            )
+        return True, torch.bfloat16, False
+    if requested == "float16":
+        return True, torch.float16, True
+    raise ValueError(f"Unsupported AMP dtype: {requested}")
+
+
 def _split_param_groups(model, bert_lr, head_lr, weight_decay=0.01):
     """
     Small LR for BERT, larger LR for the rest.
@@ -187,8 +218,8 @@ def run_train(model, cfg, train_dataloader, dev_dataloader, dev_features):
         scheduler = None
 
     # --- AMP
-    use_amp = torch.cuda.is_available() and str(device).startswith("cuda") and getattr(cfg, "use_amp", True)
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    use_amp, amp_dtype, use_scaler = _resolve_amp_dtype(model, cfg, device)
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
 
     # --- save locations
     # Prefer a directory; if cfg.save_path is a file, we drop into its parent dir.
@@ -206,7 +237,8 @@ def run_train(model, cfg, train_dataloader, dev_dataloader, dev_features):
 
     print(
         f"[train] device={device} | epochs={num_epochs} | "
-        f"metrics_type={cfg.metrics_type} | use_scheduler={use_scheduler} | AMP={use_amp}"
+        f"metrics_type={cfg.metrics_type} | use_scheduler={use_scheduler} | "
+        f"AMP={use_amp} | amp_dtype={amp_dtype} | GradScaler={use_scaler}"
     )
     print(f"[train] save_dir={save_dir}\n       best -> {best_path}\n       last -> {last_path}")
 
@@ -225,23 +257,39 @@ def run_train(model, cfg, train_dataloader, dev_dataloader, dev_features):
 
             optimizer.zero_grad(set_to_none=True)
 
+            optimizer_was_run = False
             if use_amp:
-
-                # with torch.cuda.amp.autocast():
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
                     loss = model.neg_log_likelihood_loss(sentence, masks, tags)
+                if not torch.isfinite(loss).item():
+                    raise FloatingPointError(
+                        f"Non-finite loss at epoch={epoch + 1}, step={step}, "
+                        f"amp_dtype={amp_dtype}. Training stopped before corrupting the checkpoint."
+                    )
+
+            if use_scaler:
+                scale_before = scaler.get_scale()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
+                # GradScaler lowers its scale when it skips optimizer.step().
+                optimizer_was_run = scaler.get_scale() >= scale_before
             else:
-                loss = model.neg_log_likelihood_loss(sentence, masks, tags)
+                if not use_amp:
+                    loss = model.neg_log_likelihood_loss(sentence, masks, tags)
+                    if not torch.isfinite(loss).item():
+                        raise FloatingPointError(
+                            f"Non-finite loss at epoch={epoch + 1}, step={step}. "
+                            "Training stopped before corrupting the checkpoint."
+                        )
                 loss.backward()
                 clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
+                optimizer_was_run = True
 
-            if scheduler is not None:
+            if scheduler is not None and optimizer_was_run:
                 scheduler.step()
 
             running_loss += loss.item()

@@ -8,23 +8,30 @@ import torch
 from torch.utils.data import TensorDataset, DataLoader
 
 
+def _json_safe(value):
+    """Recursively convert configuration values to JSON-safe representations."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (torch.device, torch.dtype, pathlib.Path)):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if callable(value):
+        return str(value)
+    if hasattr(value, "__dict__"):
+        return _json_safe(vars(value))
+    return str(value)
+
+
 def print_and_save_params(config, filepath):
     exclude_keys = {'tokenizer', 'model', 'id2rel', 'rel_vocab'}
-    params = {str(key): (vars(value) if hasattr(value, '__dict__') else value) for key, value in config.__dict__.items() if key not in exclude_keys}
-
-
-    # Convert non-serializable objects to strings
-    for key, value in params.items():
-        if isinstance(value, torch.device):
-            params[key] = str(value)
-        elif isinstance(value, pathlib.Path):
-            params[key] = str(value)
-        elif isinstance(value, set):
-            params[key] = list(value)
-        elif callable(value):
-            params[key] = str(value)
-        elif isinstance(value, object) and not isinstance(value, (str, int, float, list, dict)):
-            params[key] = str(value)
+    params = {
+        str(key): _json_safe(value)
+        for key, value in config.__dict__.items()
+        if key not in exclude_keys
+    }
 
     # Save parameters to file
     try:

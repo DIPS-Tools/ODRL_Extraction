@@ -13,6 +13,11 @@
 
 set -euo pipefail
 
+# Avoid inherited cluster locale warnings and tokenizer/fork warnings.
+unset LC_ALL
+export LANG=C.UTF-8
+export TOKENIZERS_PARALLELISM=false
+
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 VENV_PATH="${VENV_PATH:-/home/mh1f25/.conda/envs/odrl_extraction}"
 #MODEL_PATH="${MODERNBERT_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large}"
@@ -144,6 +149,7 @@ nvidia-smi
     --learning_rate 2e-5 \
     --label_type BIO \
     --metrics_type entity \
+    --amp_dtype bfloat16 \
     --proj_dropout 0.1 \
     --device cuda \
     --do_train \

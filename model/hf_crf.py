@@ -79,10 +79,12 @@ class HF_CRF(nn.Module):
         emissions = self.get_output_score(sentence, attention_mask=masks)
         if return_emissions:
             return type("Out", (), {"emissions": emissions})
-        _, tag_seq = self.crf._viterbi_decode(emissions, masks.bool())
+        # Keep CRF dynamic programming in FP32 even when the encoder uses AMP.
+        _, tag_seq = self.crf._viterbi_decode(emissions.float(), masks.bool())
         return tag_seq
 
     def neg_log_likelihood_loss(self, sentence, mask, tags):
         emissions = self.get_output_score(sentence, attention_mask=mask)
-        loss_value = self.crf.neg_log_likelihood_loss(emissions, mask, tags)
+        # Long CRF recurrences are numerically fragile in FP16/BF16.
+        loss_value = self.crf.neg_log_likelihood_loss(emissions.float(), mask, tags)
         return loss_value / float(emissions.size(0))

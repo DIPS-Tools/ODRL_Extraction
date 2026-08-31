@@ -60,6 +60,15 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--use_scheduler", type=bool, default=True)
+    parser.add_argument(
+        "--amp_dtype", "--amp-dtype",
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+        help=(
+            "CUDA training precision. 'auto' uses BF16 for ModernBERT and FP16 "
+            "for other encoders; float32 disables AMP."
+        ),
+    )
 
 
     # IDCNN hyperparams

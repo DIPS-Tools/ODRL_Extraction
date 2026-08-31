@@ -144,6 +144,7 @@ class Config(object):
         self.using_lstm      = bool(getattr(args, "using_lstm", False))
 
         self.use_scheduler    = getattr(args, "use_scheduler", False)
+        self.amp_dtype        = getattr(args, "amp_dtype", "auto").lower()
 
         # ---- Labels / tag mapping ----
         # Your policy/contract BIO tag set
