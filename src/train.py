@@ -219,6 +219,10 @@ def run_train(model, cfg, train_dataloader, dev_dataloader, dev_features):
 
     # --- AMP
     use_amp, amp_dtype, use_scaler = _resolve_amp_dtype(model, cfg, device)
+    if str(device).startswith("cuda") and amp_dtype == torch.float32:
+        # Use A100/H100/H200 TensorFloat32 tensor cores for stable, faster FP32
+        # matrix multiplications. CRF dynamic programming remains FP32.
+        torch.set_float32_matmul_precision("high")
     scaler = torch.amp.GradScaler(enabled=use_scaler)
 
     # --- save locations

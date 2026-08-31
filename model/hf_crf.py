@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 from model.crf import CRF
 
@@ -17,9 +17,25 @@ class HF_CRF(nn.Module):
         trust_remote_code=False,
     ):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(
+        encoder_config = AutoConfig.from_pretrained(
             encoder_name_or_path,
             trust_remote_code=trust_remote_code,
+        )
+        if str(getattr(encoder_config, "model_type", "")).lower() == "modernbert":
+            # Some ModernBERT checkpoints enable compiled reference MLP layers in
+            # their saved config. TorchInductor can return all-NaN hidden states
+            # with particular PyTorch/Triton stacks, so use the ordinary layers.
+            encoder_config.reference_compile = False
+
+        self.encoder = AutoModel.from_pretrained(
+            encoder_name_or_path,
+            config=encoder_config,
+            trust_remote_code=trust_remote_code,
+        )
+        print(
+            "[HF_CRF] "
+            f"encoder_model_type={getattr(self.encoder.config, 'model_type', 'unknown')} "
+            f"reference_compile={getattr(self.encoder.config, 'reference_compile', 'n/a')}"
         )
         self.backbone_param_prefixes = ("encoder.",)
 
