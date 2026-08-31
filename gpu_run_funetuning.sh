@@ -17,6 +17,10 @@ set -euo pipefail
 unset LC_ALL
 export LANG=C.UTF-8
 export TOKENIZERS_PARALLELISM=false
+# Use the most conservative ModernBERT attention implementation. Once this
+# environment passes the preflight and training, SDPA can be benchmarked by
+# submitting with ODRL_MODERNBERT_ATTN_IMPLEMENTATION=sdpa.
+export ODRL_MODERNBERT_ATTN_IMPLEMENTATION="${ODRL_MODERNBERT_ATTN_IMPLEMENTATION:-eager}"
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 VENV_PATH="${VENV_PATH:-/home/mh1f25/.conda/envs/odrl_extraction}"
@@ -91,6 +95,14 @@ echo "Model: $MODEL_PATH"
 nvidia-smi
 
 "$PYTHON_BIN" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
+
+echo "Running ModernBERT checkpoint and preprocessing preflight..."
+"$PYTHON_BIN" -u demo_test/test_modernbert_forward.py \
+    --model-path "$MODEL_PATH" \
+    --dataset ./data/train_correct_with_agent_gpt-5.6-luna_flat.txt \
+    --max-length 400 \
+    --attention "$ODRL_MODERNBERT_ATTN_IMPLEMENTATION" \
+    --device cuda
 
 # Previous DeBERTa-v3-large + CRF experiment:
 # "$PYTHON_BIN" -u main.py \

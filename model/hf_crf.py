@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
@@ -28,9 +30,13 @@ class HF_CRF(nn.Module):
             # their saved config. TorchInductor can return all-NaN hidden states
             # with particular PyTorch/Triton stacks, so use the ordinary layers.
             encoder_config.reference_compile = False
-            # Flash Attention has a documented ModernBERT NaN-output failure in
-            # some environments. SDPA is slower but is the stable HF backend.
-            model_load_kwargs["attn_implementation"] = "sdpa"
+            # ModernBERT attention kernels are sensitive to the exact
+            # Transformers/PyTorch/CUDA combination.  The eager backend is the
+            # conservative default for training; an explicitly tested backend
+            # can still be selected from the job environment.
+            model_load_kwargs["attn_implementation"] = os.getenv(
+                "ODRL_MODERNBERT_ATTN_IMPLEMENTATION", "eager"
+            )
 
         self.encoder = AutoModel.from_pretrained(
             encoder_name_or_path,
@@ -89,7 +95,19 @@ class HF_CRF(nn.Module):
                 attention_mask=attention_mask,
                 return_dict=True,
             )
-        return outputs.last_hidden_state
+        hidden_states = outputs.last_hidden_state
+        if not torch.isfinite(hidden_states).all().item():
+            nonfinite = int((~torch.isfinite(hidden_states)).sum().item())
+            valid_ids = input_ids[attention_mask.bool()] if attention_mask is not None else input_ids
+            raise FloatingPointError(
+                "ModernBERT/Transformer encoder produced non-finite hidden states before "
+                "the classifier or CRF: "
+                f"{nonfinite}/{hidden_states.numel()} values are NaN or Inf; "
+                f"hidden_dtype={hidden_states.dtype}; "
+                f"input_id_range=[{int(valid_ids.min().item())}, {int(valid_ids.max().item())}]; "
+                f"valid_tokens={int(attention_mask.sum().item()) if attention_mask is not None else input_ids.numel()}."
+            )
+        return hidden_states
 
     def get_output_score(self, sentence, attention_mask=None):
         embeddings = self._encode(sentence, attention_mask=attention_mask)

@@ -993,7 +993,17 @@ def encode_with_alignment(text, labels, tokenizer, l2i, max_length):
     return input_ids, attn_mask, label_ids, crf_mask
 
 
-def _encode_sample(words, labels, tokenizer, l2i, max_length, cls_id, sep_id, pad_id):
+def _encode_sample(
+    words,
+    labels,
+    tokenizer,
+    l2i,
+    max_length,
+    cls_id,
+    sep_id,
+    token_pad_id,
+    label_pad_id,
+):
     """
     Build InputFeatures for one sample:
     - keep only the FIRST subword of each word (to preserve 1:1 labels)
@@ -1043,9 +1053,9 @@ def _encode_sample(words, labels, tokenizer, l2i, max_length, cls_id, sep_id, pa
 
     # Pad
     while len(input_ids) < max_length:
-        input_ids.append(0)
+        input_ids.append(token_pad_id)
         input_mask.append(0)
-        label_ids.append(pad_id)
+        label_ids.append(label_pad_id)
 
     # Truncate hard if necessary (shouldn't happen due to max_words)
     input_ids = input_ids[:max_length]
@@ -1072,6 +1082,12 @@ def _build_features(jsonl_path, tokenizer, l2i, max_length, label_type):
     sep_id = tokenizer.sep_token_id if tokenizer.sep_token_id is not None else (
         tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 102  # BERT [SEP]
     )
+    token_pad_id = tokenizer.pad_token_id
+    if token_pad_id is None:
+        raise ValueError(
+            f"Tokenizer {tokenizer.__class__.__name__} has no pad_token_id. "
+            "Configure a padding token before building NER features."
+        )
     pad_label_id = l2i["<pad>"]  # from your Config
 
     features = []
@@ -1099,6 +1115,7 @@ def _build_features(jsonl_path, tokenizer, l2i, max_length, label_type):
             max_length,
             cls_id,
             sep_id,
+            token_pad_id,
             pad_label_id,
         )
         features.append(feat)

@@ -19,9 +19,11 @@ class FakeEncoder(nn.Module):
 
 
 class GenericTransformerCrfTests(unittest.TestCase):
+    @patch("model.hf_crf.AutoConfig.from_pretrained")
     @patch("model.hf_crf.AutoModel.from_pretrained")
-    def test_emissions_and_decode_without_lstm(self, from_pretrained):
-        from_pretrained.return_value = FakeEncoder()
+    def test_emissions_and_decode_without_lstm(self, model_from_pretrained, config_from_pretrained):
+        config_from_pretrained.return_value = SimpleNamespace(model_type="bert")
+        model_from_pretrained.return_value = FakeEncoder()
         model = HF_CRF(
             "fake-encoder",
             tagset_size=17,
