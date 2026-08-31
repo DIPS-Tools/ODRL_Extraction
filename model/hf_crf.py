@@ -21,21 +21,28 @@ class HF_CRF(nn.Module):
             encoder_name_or_path,
             trust_remote_code=trust_remote_code,
         )
-        if str(getattr(encoder_config, "model_type", "")).lower() == "modernbert":
+        is_modernbert = str(getattr(encoder_config, "model_type", "")).lower() == "modernbert"
+        model_load_kwargs = {}
+        if is_modernbert:
             # Some ModernBERT checkpoints enable compiled reference MLP layers in
             # their saved config. TorchInductor can return all-NaN hidden states
             # with particular PyTorch/Triton stacks, so use the ordinary layers.
             encoder_config.reference_compile = False
+            # Flash Attention has a documented ModernBERT NaN-output failure in
+            # some environments. SDPA is slower but is the stable HF backend.
+            model_load_kwargs["attn_implementation"] = "sdpa"
 
         self.encoder = AutoModel.from_pretrained(
             encoder_name_or_path,
             config=encoder_config,
             trust_remote_code=trust_remote_code,
+            **model_load_kwargs,
         )
         print(
             "[HF_CRF] "
             f"encoder_model_type={getattr(self.encoder.config, 'model_type', 'unknown')} "
-            f"reference_compile={getattr(self.encoder.config, 'reference_compile', 'n/a')}"
+            f"reference_compile={getattr(self.encoder.config, 'reference_compile', 'n/a')} "
+            f"attention={getattr(self.encoder.config, '_attn_implementation', 'unknown')}"
         )
         self.backbone_param_prefixes = ("encoder.",)
 
