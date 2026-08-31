@@ -8,8 +8,8 @@
 #SBATCH --partition=a100
 #SBATCH --gres=gpu:1
 #SBATCH --time=60:00:00
-#SBATCH --job-name=odrl_modernbert_large
-#SBATCH --output=./result_out/main_modernbert-large_crf_correct_data_gpt-5.6-luna-v2-%j.out
+#SBATCH --job-name=odrl_ner_train
+#SBATCH --output=./result_out/main_odrl_ner_train-%j.out
 
 set -euo pipefail
 
@@ -17,16 +17,80 @@ set -euo pipefail
 unset LC_ALL
 export LANG=C.UTF-8
 export TOKENIZERS_PARALLELISM=false
-# Use the most conservative ModernBERT attention implementation. Once this
-# environment passes the preflight and training, SDPA can be benchmarked by
-# submitting with ODRL_MODERNBERT_ATTN_IMPLEMENTATION=sdpa.
-export ODRL_MODERNBERT_ATTN_IMPLEMENTATION="${ODRL_MODERNBERT_ATTN_IMPLEMENTATION:-eager}"
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-$(pwd)}"
 VENV_PATH="${VENV_PATH:-/home/mh1f25/.conda/envs/odrl_extraction}"
-#MODEL_PATH="${MODERNBERT_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large}"
-#MODEL_PATH="${MODERNBERT_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/RoBERTa-large}"
-MODEL_PATH="${MODERNBERT_MODEL_PATH:-/iridisfs/scratch/mh1f25/llms_model/ModernBERT-large}"
+
+# =============================================================================
+# MODEL SELECTION
+# =============================================================================
+# Default profile. Change only this value, or override it without editing:
+#   sbatch --export=ALL,MODEL_PROFILE=deberta-v3-large gpu_run_funetuning.sh
+#
+# Supported values:
+#   modernbert-large   ModernBERT-large + CRF
+#   deberta-v3-large  DeBERTa-v3-large + CRF
+#   bert               Contract BERT-base + CRF
+MODEL_PROFILE="${MODEL_PROFILE:-modernbert-large}"
+
+# Shared dataset/training settings. Every value can also be overridden through
+# `sbatch --export=ALL,NAME=value,...`.
+DATA_PATH="${DATA_PATH:-./data/}"
+TRAIN_FILE="${TRAIN_FILE:-train_correct_with_agent_gpt-5.6-luna_flat.txt}"
+VALID_FILE="${VALID_FILE:-valid_correct_with_agent_gpt-5.6-luna_flat.txt}"
+TEST_FILE="${TEST_FILE:-test_correct_with_agent_gpt-5.6-luna_flat.txt}"
+DATA_TAG="${DATA_TAG:-correct_data_with_agent_gpt-5.6-luna-v2}"
+SAVE_DIR="${SAVE_DIR:-./save_model}"
+NUM_EPOCHS="${NUM_EPOCHS:-20}"
+METRICS_TYPE="${METRICS_TYPE:-entity}"
+PROJ_DROPOUT="${PROJ_DROPOUT:-0.1}"
+
+# Each profile defines only the settings that differ by encoder.
+case "$MODEL_PROFILE" in
+    modernbert-large)
+        MODEL_NAME="modernbert-large-crf"
+        DEFAULT_MODEL_PATH="/iridisfs/scratch/mh1f25/llms_model/ModernBERT-large"
+        DEFAULT_BATCH_SIZE=8
+        DEFAULT_MAX_LENGTH=400
+        DEFAULT_LEARNING_RATE=2e-5
+        DEFAULT_LABEL_TYPE=BIO
+        DEFAULT_AMP_DTYPE=float32
+        ;;
+    deberta-v3-large)
+        MODEL_NAME="deberta-v3-large-crf"
+        DEFAULT_MODEL_PATH="/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large"
+        DEFAULT_BATCH_SIZE=8
+        DEFAULT_MAX_LENGTH=400
+        DEFAULT_LEARNING_RATE=2e-5
+        DEFAULT_LABEL_TYPE=BIO
+        DEFAULT_AMP_DTYPE=auto
+        ;;
+    bert)
+        MODEL_NAME="contract-bert-crf"
+        DEFAULT_MODEL_PATH="/iridisfs/scratch/mh1f25/llms_model/bert-base-uncased-contracts"
+        DEFAULT_BATCH_SIZE=16
+        DEFAULT_MAX_LENGTH=400
+        DEFAULT_LEARNING_RATE=5e-5
+        DEFAULT_LABEL_TYPE=BIO
+        DEFAULT_AMP_DTYPE=auto
+        ;;
+    *)
+        echo "ERROR: unsupported MODEL_PROFILE='$MODEL_PROFILE'." >&2
+        echo "Choose: modernbert-large, deberta-v3-large, or bert." >&2
+        exit 2
+        ;;
+esac
+
+# Optional per-run overrides, applied after the selected profile.
+MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
+BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_BATCH_SIZE}"
+MAX_LENGTH="${MAX_LENGTH:-$DEFAULT_MAX_LENGTH}"
+LEARNING_RATE="${LEARNING_RATE:-$DEFAULT_LEARNING_RATE}"
+LABEL_TYPE="${LABEL_TYPE:-$DEFAULT_LABEL_TYPE}"
+AMP_DTYPE="${AMP_DTYPE:-$DEFAULT_AMP_DTYPE}"
+
+# ModernBERT uses the conservative eager backend unless explicitly overridden.
+export ODRL_MODERNBERT_ATTN_IMPLEMENTATION="${ODRL_MODERNBERT_ATTN_IMPLEMENTATION:-eager}"
 
 cd "$PROJECT_DIR"
 
@@ -67,15 +131,15 @@ if [[ "$ACTIVE_PYTHON" != "$PYTHON_BIN" ]]; then
 fi
 
 if [[ ! -d "$MODEL_PATH" ]]; then
-    echo "ERROR: ModernBERT model directory not found: $MODEL_PATH" >&2
-    echo "Copy/download it first, or submit with MODERNBERT_MODEL_PATH=/path/to/model." >&2
+    echo "ERROR: model directory not found: $MODEL_PATH" >&2
+    echo "Copy/download it first, or submit with MODEL_PATH=/path/to/model." >&2
     exit 1
 fi
 
 for DATA_FILE in \
-    data/train_correct_with_agent_gpt-5.6-luna_flat.txt \
-    data/valid_correct_with_agent_gpt-5.6-luna_flat.txt \
-    data/test_correct_with_agent_gpt-5.6-luna_flat.txt
+    "$DATA_PATH/$TRAIN_FILE" \
+    "$DATA_PATH/$VALID_FILE" \
+    "$DATA_PATH/$TEST_FILE"
 do
     if [[ ! -f "$DATA_FILE" ]]; then
         echo "ERROR: dataset file not found: $DATA_FILE" >&2
@@ -83,86 +147,40 @@ do
     fi
 done
 
-mkdir -p save_model
+mkdir -p "$SAVE_DIR"
 
 echo "Job started: $(date --iso-8601=seconds)"
 echo "Host: $(hostname)"
 echo "Project: $PROJECT_DIR"
 echo "Environment: ${CONDA_PREFIX:-${VIRTUAL_ENV:-$VENV_PATH}}"
 echo "Python: $PYTHON_BIN"
-echo "Model: $MODEL_PATH"
+echo "Model profile: $MODEL_PROFILE"
+echo "Model name: $MODEL_NAME"
+echo "Model path: $MODEL_PATH"
+echo "Dataset: $DATA_PATH ($TRAIN_FILE, $VALID_FILE, $TEST_FILE)"
+echo "Settings: epochs=$NUM_EPOCHS batch_size=$BATCH_SIZE max_length=$MAX_LENGTH learning_rate=$LEARNING_RATE label_type=$LABEL_TYPE amp_dtype=$AMP_DTYPE metrics_type=$METRICS_TYPE"
 
 nvidia-smi
 
 "$PYTHON_BIN" -c 'import torch, transformers; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"cuda_available={torch.cuda.is_available()}"); print(f"cuda_runtime={torch.version.cuda}"); assert torch.cuda.is_available(), "PyTorch cannot access the allocated GPU"'
 
-#echo "Running ModernBERT checkpoint and preprocessing preflight..."
-#"$PYTHON_BIN" -u demo_test/test_modernbert_forward.py \
-#    --model-path "$MODEL_PATH" \
-#    --dataset ./data/train_correct_with_agent_gpt-5.6-luna_flat.txt \
-#    --max-length 400 \
-#    --attention "$ODRL_MODERNBERT_ATTN_IMPLEMENTATION" \
-#    --device cuda
-
-# Previous DeBERTa-v3-large + CRF experiment:
-# "$PYTHON_BIN" -u main.py \
-#     --model deberta-v3-large-crf \
-#     --data_path ./data/ \
-#     --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
-#     --valid_file valid_correct_with_agent_gpt-5.6-luna_flat.txt \
-#     --test_file test_correct_with_agent_gpt-5.6-luna_flat.txt \
-#     --data_tag correct_data_with_agent_gpt-5.6-luna-v2 \
-#     --save_dir ./save_model \
-#     --word_embedding_model_path /iridisfs/scratch/mh1f25/llms_model/deberta-v3-large \
-#     --num_epochs 20 \
-#     --batch_size 8 \
-#     --max_length 512 \
-#     --learning_rate 2e-5 \
-#     --label_type BIOES \
-#     --metrics_type entity \
-#     --proj_dropout 0.1 \
-#     --device cuda \
-#     --do_train \
-#     --do_test
-
-# Previous RoBERTa-large + CRF experiment:
-# "$PYTHON_BIN" -u main.py \
-#     --model roberta-large-crf \
-#     --data_path ./data/ \
-#     --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
-#     --valid_file valid_correct_with_agent_gpt-5.6-luna_flat.txt \
-#     --test_file test_correct_with_agent_gpt-5.6-luna_flat.txt \
-#     --data_tag correct_data_with_agent_gpt-5.6-luna-v2 \
-#     --save_dir ./save_model \
-#     --word_embedding_model_path /iridisfs/scratch/mh1f25/llms_model/roberta-large \
-#     --num_epochs 20 \
-#     --batch_size 8 \
-#     --max_length 400 \
-#     --learning_rate 2e-5 \
-#     --label_type BIO \
-#     --metrics_type entity \
-#     --proj_dropout 0.1 \
-#     --device cuda \
-#     --do_train \
-#     --do_test
-
 "$PYTHON_BIN" -u main.py \
-    --model modernbert-large-crf \
-    --data_path ./data/ \
-    --train_file train_correct_with_agent_gpt-5.6-luna_flat.txt \
-    --valid_file valid_correct_with_agent_gpt-5.6-luna_flat.txt \
-    --test_file test_correct_with_agent_gpt-5.6-luna_flat.txt \
-    --data_tag correct_data_with_agent_gpt-5.6-luna-v2 \
-    --save_dir ./save_model \
+    --model "$MODEL_NAME" \
+    --data_path "$DATA_PATH" \
+    --train_file "$TRAIN_FILE" \
+    --valid_file "$VALID_FILE" \
+    --test_file "$TEST_FILE" \
+    --data_tag "$DATA_TAG" \
+    --save_dir "$SAVE_DIR" \
     --word_embedding_model_path "$MODEL_PATH" \
-    --num_epochs 20 \
-    --batch_size 8 \
-    --max_length 400 \
-    --learning_rate 2e-5 \
-    --label_type BIO \
-    --metrics_type entity \
-    --amp_dtype float32 \
-    --proj_dropout 0.1 \
+    --num_epochs "$NUM_EPOCHS" \
+    --batch_size "$BATCH_SIZE" \
+    --max_length "$MAX_LENGTH" \
+    --learning_rate "$LEARNING_RATE" \
+    --label_type "$LABEL_TYPE" \
+    --metrics_type "$METRICS_TYPE" \
+    --amp_dtype "$AMP_DTYPE" \
+    --proj_dropout "$PROJ_DROPOUT" \
     --device cuda \
     --do_train \
     --do_test
@@ -172,56 +190,50 @@ echo "Job finished: $(date --iso-8601=seconds)"
 
 
 
-# mkdir -p result_out save_model
- #  sbatch gpu_run_funetuning.sh
- #
- #  Although each node has two GPUs, request only one. The current training code is single-GPU and does
- #  not use distributed training; requesting two would waste the second GPU.
- #
- #  An A100 80GB should comfortably handle:
- #
- #  DeBERTa-v3-large + CRF
- #  max_length=400
- #  batch_size=8
- #  mixed-precision training
- #
- #  You could potentially increase batch size to 16, but start with 8 to establish a reliable baseline.
- #  Check memory during training with:
- #
- #  watch -n 2 nvidia-smi
- #
- #  My partition ranking for this experiment is:
- #
- #  1. a100 — recommended, non-preemptible, up to 60 hours.
- #  2. dual_h200 or quad_h200 — potentially faster, but unnecessary for this dataset.
- #  3. scavenger_4a100 — only for short experiments; 12-hour limit and preemption risk.
- #  4. scavenger_8h100 — fast but also preemptible and limited to 12 hours.
- #  5. Private swarm_a100/swarm_h100 — only if you are eligible.
-#  ST = PD
+#  - modernbert-large
+  #  - deberta-v3-large
+  #  - bert — contract BERT + CRF
   #
-  #  PD means Slurm has not allocated an A100 yet. (None) means no specific blocking reason
-  #  is currently reported; it may simply be waiting for the scheduler’s next allocation
-  #  cycle.
+  #  There is now one shared training command. You do not need to comment/uncomment model
+  #  blocks.
   #
-  #  Check full details:
+  #  Run DeBERTa:
   #
-  #  scontrol show job 1477910
+  #  sbatch \
+  #    --export=ALL,MODEL_PROFILE=deberta-v3-large \
+  #    --job-name=odrl_deberta \
+  #    --output=result_out/main_deberta-%j.out \
+  #    gpu_run_funetuning.sh
   #
-  #  Show the pending reason more clearly:
+  #  Run ModernBERT:
   #
-  #  squeue -j 1477910 -o "%.18i %.9P %.20j %.8u %.2t %.10M %.6D %R"
+  #  sbatch \
+  #    --export=ALL,MODEL_PROFILE=modernbert-large \
+  #    --job-name=odrl_modernbert \
+  #    --output=result_out/main_modernbert-%j.out \
+  #    gpu_run_funetuning.sh
   #
-  #  Check priority:
+  #  Run contract BERT:
   #
-  #  sprio -j 1477910
+  #  sbatch \
+  #    --export=ALL,MODEL_PROFILE=bert \
+  #    --job-name=odrl_bert \
+  #    --output=result_out/main_bert-%j.out \
+  #    gpu_run_funetuning.sh
   #
-  #  Monitor it:
+  #  Running without a profile uses ModernBERT:
   #
-  #  watch -n 10 'squeue -j 1477910'
+  #  sbatch gpu_run_funetuning.sh
   #
-  #  When it starts, ST changes from PD to R, and a node such as rose02 will appear. Then
-  #  monitor the output:
+  #  Each profile sets its own model path, model identifier, batch size, maximum length,
+  #  learning rate, label type, and AMP precision. ModernBERT alone runs its diagnostic
+  #  preflight.
   #
-  #  tail -f result_out/main_deberta-v3-large_crf_correct_data_gpt-5.6-luna-v2-1477910.out
+  #  You can override individual settings:
   #
-  #  There is no need to resubmit or cancel it at this point.
+  #  sbatch \
+  #    --export=ALL,MODEL_PROFILE=deberta-v3-
+  #    large,BATCH_SIZE=16,MAX_LENGTH=512,LEARNING_RATE=1e-5 \
+  #    gpu_run_funetuning.sh
+  #
+  #  The script passes Bash syntax validation.
