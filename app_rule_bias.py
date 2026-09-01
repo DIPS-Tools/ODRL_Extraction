@@ -45,6 +45,17 @@ class ODRLRule(BaseModel):
 class ODRLGenerationResponse(BaseModel):
     rules: List[ODRLRule]
 
+
+def _clean_output_token(token: str) -> str:
+    """Remove tokenizer-only word-boundary markers from public output.
+
+    DeBERTa/SentencePiece uses ``▁`` and RoBERTa-style tokenizers can use
+    ``Ġ`` to represent preceding whitespace.  These markers are useful while
+    constructing encoder inputs but are not part of the source text.
+    """
+    cleaned = str(token).lstrip("▁Ġ").strip()
+    return cleaned if cleaned else str(token).strip()
+
 def get_input(config, sample):
     """
     Build a single-sample batch (input_ids, attention_mask) for inference.
@@ -52,7 +63,7 @@ def get_input(config, sample):
     Returns:
         input_ids: LongTensor [1, max_length]
         masks:     LongTensor [1, max_length]
-        words:     List[str]  (the truncated word-level tokens used)
+        words:     List[str]  (clean tokens for rules and public output)
     """
     tokenizer  = config.tokenizer
     max_length = config.max_length
@@ -66,18 +77,21 @@ def get_input(config, sample):
     )
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
-    # Word-level tokens (your own helper that splits words/punct like in training)
-    words = _words_from_text(sample, tokenizer)
+    # Remove form/textarea line endings around the input. Keep the tokenizer's
+    # raw word-boundary markers internally so model preprocessing remains
+    # identical to training.
+    sample = str(sample).strip()
+    model_words = _words_from_text(sample, tokenizer)
 
     # keep room for [CLS] and [SEP]
     max_words = max_length - 2
-    words = words[:max_words]
+    model_words = model_words[:max_words]
 
     # Build ids/masks (keep only the FIRST subword for each word)
     input_ids = [cls_id]
     masks     = [1]
 
-    for w in words:
+    for w in model_words:
         sub_tokens = tokenizer.tokenize(w)
         if not sub_tokens:
             sub_tokens = [tokenizer.unk_token or "[UNK]"]
@@ -105,7 +119,10 @@ def get_input(config, sample):
     input_ids = torch.tensor([input_ids], dtype=torch.long)
     masks     = torch.tensor([masks],     dtype=torch.long)
 
-    return input_ids, masks, words
+    # Rules, logs, HTML, and ODRL serialization should see ordinary source
+    # tokens rather than SentencePiece/byte-BPE whitespace markers.
+    output_words = [_clean_output_token(word) for word in model_words]
+    return input_ids, masks, output_words
 
 def _sanitize_paths(pred_ids, label2id):
     """Clamp any id outside label map width to 'O'."""

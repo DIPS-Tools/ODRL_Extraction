@@ -8,8 +8,8 @@
     :root{
       --bg:#0f1220; --panel:#161a2b; --ink:#e6e8f0; --muted:#9aa3b2; --accent:#6ea8fe;
       --chip:#20253d; --chipBorder:#2a3150; --o:#414a67;
-      --ASSET:#ffd166; --ACTION: #dc3daa; --RULE_TYPE:#6ea8fe; --CONSTRAINT:#ff7b7b;
-      --DUTY:#c77dff; --PURPOSE:#57cc99; --P_ASSIGNEE:#f79d65; --P_ASSIGNER:#ff5d8f;
+      --ASSET:#ffd166; --ACTION:#dc3daa; --RULE_TYPE:#6ea8fe; --CONSTRAINT:#ff7b7b;
+      --ASSIGNEE:#f79d65; --DUTY:#c77dff; --PURPOSE:#57cc99; --P_ASSIGNEE:#f79d65; --P_ASSIGNER:#ff5d8f;
       --P_CONSEQUENCE: #3229b6;
 
 
@@ -53,6 +53,7 @@
     .e-O      {background:var(--o); color:#cfd5e6}
     .e-ASSET  {background:var(--ASSET); color:#3a2f00}
     .e-ACTION {background:var(--ACTION); color:#002a1e}
+    .e-ASSIGNEE{background:var(--ASSIGNEE); color:#301400}
     .e-RULE_TYPE{background:var(--RULE_TYPE); color:#041530}
     .e-CONSTRAINT{background:var(--CONSTRAINT); color:#3b0000}
     .e-DUTY   {background:var(--DUTY); color:#1b0030}
@@ -82,7 +83,7 @@
             <textarea name="text" placeholder="Paste a sentence to tag…">{{ (question or '')|e }}</textarea>
             <div class="actions">
               <button type="submit">Label sentence</button>
-              <span class="help">BIO tags: ASSET, ACTION, RULE_TYPE, CONSTRAINT, DUTY, PURPOSE, PARTY_ASSIGNER/ASSIGNEE, CONSEQUENCE</span>
+              <span class="help">BIOES tags: ASSIGNEE, ACTION, ASSET, RULE_TYPE, CONSTRAINT, PURPOSE</span>
             </div>
           </div>
         </div>
@@ -91,6 +92,7 @@
       <div class="legend">
         <span class="tag"><span class="sw" style="background:var(--ASSET)"></span>ASSET</span>
         <span class="tag"><span class="sw" style="background:var(--ACTION)"></span>ACTION</span>
+        <span class="tag"><span class="sw" style="background:var(--ASSIGNEE)"></span>ASSIGNEE</span>
         <span class="tag"><span class="sw" style="background:var(--RULE_TYPE)"></span>RULE_TYPE</span>
         <span class="tag"><span class="sw" style="background:var(--CONSTRAINT)"></span>CONSTRAINT</span>
         <span class="tag"><span class="sw" style="background:var(--DUTY)"></span>DUTY</span>
@@ -120,8 +122,10 @@
             {% set token = result.text[i] %}
             {% set lab = result.labels[i] %}
             {% set base = (lab.split('-', 1)[1]) if ('-' in lab) else lab %}
-            {% if base not in [
-              'ASSET','ACTION','RULE_TYPE','CONSTRAINT','DUTY','PURPOSE','PARTY_ASSIGNEE','PARTY_ASSIGNER', 'CONSEQUENCE' ,'O'
+            {% if base.startswith('RULE_TYPE') %}
+              {% set base = 'RULE_TYPE' %}
+            {% elif base not in [
+              'ASSET','ACTION','ASSIGNEE','CONSTRAINT','DUTY','PURPOSE','PARTY_ASSIGNEE','PARTY_ASSIGNER','CONSEQUENCE','O'
             ] %}
               {% set base = 'O' %}
             {% endif %}

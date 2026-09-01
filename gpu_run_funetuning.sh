@@ -199,19 +199,19 @@ echo "Job finished: $(date --iso-8601=seconds)"
   #
   #  Run DeBERTa:
   #
-  #  sbatch \
-  #    --export=ALL,MODEL_PROFILE=deberta-v3-large \
-  #    --job-name=odrl_deberta \
-  #    --output=result_out/main_deberta-%j.out \
-  #    gpu_run_funetuning.sh
+#    sbatch \
+#      --export=ALL,MODEL_PROFILE=deberta-v3-large,NUM_EPOCHS=30,LABEL_TYPE=BIOSE \
+#      --job-name=odrl_deberta \
+#      --output=result_out/main_deberta_ltBIOSE_epoch30_-%j.out \
+#      gpu_run_funetuning.sh
   #
   #  Run ModernBERT:
   #
-  #  sbatch \
-  #    --export=ALL,MODEL_PROFILE=modernbert-large \
-  #    --job-name=odrl_modernbert \
-  #    --output=result_out/main_modernbert-%j.out \
-  #    gpu_run_funetuning.sh
+#    sbatch \
+#      --export=ALL,MODEL_PROFILE=modernbert-large \
+#      --job-name=odrl_modernbert \
+#      --output=result_out/main_modernbert-%j.out \
+#      gpu_run_funetuning.sh
   #
   #  Run contract BERT:
   #
