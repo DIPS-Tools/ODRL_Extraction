@@ -29,7 +29,9 @@ VENV_PATH="${VENV_PATH:-/home/mh1f25/.conda/envs/odrl_extraction}"
 #
 # Supported values:
 #   modernbert-large   ModernBERT-large + CRF
-#   deberta-v3-large  DeBERTa-v3-large + CRF
+#   deberta-v3-large   DeBERTa-v3-large + CRF
+#   deberta-v3-large-lstm
+#                      DeBERTa-v3-large + BiLSTM + CRF
 #   bert               Contract BERT-base + CRF
 MODEL_PROFILE="${MODEL_PROFILE:-modernbert-large}"
 
@@ -55,6 +57,7 @@ case "$MODEL_PROFILE" in
         DEFAULT_LEARNING_RATE=2e-5
         DEFAULT_LABEL_TYPE=BIO
         DEFAULT_AMP_DTYPE=float32
+        DEFAULT_USING_LSTM=0
         ;;
     deberta-v3-large)
         MODEL_NAME="deberta-v3-large-crf"
@@ -64,6 +67,17 @@ case "$MODEL_PROFILE" in
         DEFAULT_LEARNING_RATE=2e-5
         DEFAULT_LABEL_TYPE=BIO
         DEFAULT_AMP_DTYPE=auto
+        DEFAULT_USING_LSTM=0
+        ;;
+    deberta-v3-large-lstm)
+        MODEL_NAME="deberta-v3-large-lstm-crf"
+        DEFAULT_MODEL_PATH="/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large"
+        DEFAULT_BATCH_SIZE=8
+        DEFAULT_MAX_LENGTH=512
+        DEFAULT_LEARNING_RATE=2e-5
+        DEFAULT_LABEL_TYPE=BIOES
+        DEFAULT_AMP_DTYPE=auto
+        DEFAULT_USING_LSTM=1
         ;;
     bert)
         MODEL_NAME="contract-bert-crf"
@@ -73,10 +87,11 @@ case "$MODEL_PROFILE" in
         DEFAULT_LEARNING_RATE=5e-5
         DEFAULT_LABEL_TYPE=BIO
         DEFAULT_AMP_DTYPE=auto
+        DEFAULT_USING_LSTM=0
         ;;
     *)
         echo "ERROR: unsupported MODEL_PROFILE='$MODEL_PROFILE'." >&2
-        echo "Choose: modernbert-large, deberta-v3-large, or bert." >&2
+        echo "Choose: modernbert-large, deberta-v3-large, deberta-v3-large-lstm, or bert." >&2
         exit 2
         ;;
 esac
@@ -88,6 +103,23 @@ MAX_LENGTH="${MAX_LENGTH:-$DEFAULT_MAX_LENGTH}"
 LEARNING_RATE="${LEARNING_RATE:-$DEFAULT_LEARNING_RATE}"
 LABEL_TYPE="${LABEL_TYPE:-$DEFAULT_LABEL_TYPE}"
 AMP_DTYPE="${AMP_DTYPE:-$DEFAULT_AMP_DTYPE}"
+USING_LSTM="${USING_LSTM:-$DEFAULT_USING_LSTM}"
+HIDDEN_DIM="${HIDDEN_DIM:-768}"
+RNN_LAYERS="${RNN_LAYERS:-1}"
+RNN_DROPOUT="${RNN_DROPOUT:-0.1}"
+
+MODEL_EXTRA_ARGS=()
+if [[ "$USING_LSTM" == "1" ]]; then
+    MODEL_EXTRA_ARGS+=(
+        --using-lstm
+        --hidden_dim "$HIDDEN_DIM"
+        --rnn_layers "$RNN_LAYERS"
+        --rnn_dropout "$RNN_DROPOUT"
+    )
+elif [[ "$USING_LSTM" != "0" ]]; then
+    echo "ERROR: USING_LSTM must be 0 or 1; received '$USING_LSTM'." >&2
+    exit 2
+fi
 
 # ModernBERT uses the conservative eager backend unless explicitly overridden.
 export ODRL_MODERNBERT_ATTN_IMPLEMENTATION="${ODRL_MODERNBERT_ATTN_IMPLEMENTATION:-eager}"
@@ -158,7 +190,7 @@ echo "Model profile: $MODEL_PROFILE"
 echo "Model name: $MODEL_NAME"
 echo "Model path: $MODEL_PATH"
 echo "Dataset: $DATA_PATH ($TRAIN_FILE, $VALID_FILE, $TEST_FILE)"
-echo "Settings: epochs=$NUM_EPOCHS batch_size=$BATCH_SIZE max_length=$MAX_LENGTH learning_rate=$LEARNING_RATE label_type=$LABEL_TYPE amp_dtype=$AMP_DTYPE metrics_type=$METRICS_TYPE"
+echo "Settings: epochs=$NUM_EPOCHS batch_size=$BATCH_SIZE max_length=$MAX_LENGTH learning_rate=$LEARNING_RATE label_type=$LABEL_TYPE amp_dtype=$AMP_DTYPE metrics_type=$METRICS_TYPE using_lstm=$USING_LSTM hidden_dim=$HIDDEN_DIM rnn_layers=$RNN_LAYERS"
 
 nvidia-smi
 
@@ -182,6 +214,7 @@ nvidia-smi
     --amp_dtype "$AMP_DTYPE" \
     --proj_dropout "$PROJ_DROPOUT" \
     --device cuda \
+    "${MODEL_EXTRA_ARGS[@]}" \
     --do_train \
     --do_test
 
@@ -200,9 +233,17 @@ echo "Job finished: $(date --iso-8601=seconds)"
   #  Run DeBERTa:
   #
 #    sbatch \
-#      --export=ALL,MODEL_PROFILE=deberta-v3-large,NUM_EPOCHS=30,LABEL_TYPE=BIOSE \
+#      --export=ALL,MODEL_PROFILE=deberta-v3-large,NUM_EPOCHS=30,LABEL_TYPE=BIOES \
 #      --job-name=odrl_deberta \
 #      --output=result_out/main_deberta_ltBIOSE_epoch30_-%j.out \
+#      gpu_run_funetuning.sh
+  #
+  #  Run DeBERTa + BiLSTM + CRF:
+  #
+#    sbatch \
+#      --export=ALL,MODEL_PROFILE=deberta-v3-large-lstm,NUM_EPOCHS=30 \
+#      --job-name=odrl_deberta_lstm \
+#      --output=result_out/main_deberta_lstm_ltBIOES_epoch30-%j.out \
 #      gpu_run_funetuning.sh
   #
   #  Run ModernBERT:
@@ -226,8 +267,7 @@ echo "Job finished: $(date --iso-8601=seconds)"
   #  sbatch gpu_run_funetuning.sh
   #
   #  Each profile sets its own model path, model identifier, batch size, maximum length,
-  #  learning rate, label type, and AMP precision. ModernBERT alone runs its diagnostic
-  #  preflight.
+  #  learning rate, label type, architecture, and AMP precision.
   #
   #  You can override individual settings:
   #
