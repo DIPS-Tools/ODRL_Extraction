@@ -7,7 +7,8 @@ from utils import build_dataset, build_iterator, get_time_dif
 
 # 命令行参数解析
 parser = argparse.ArgumentParser(description="Text Classification")
-parser.add_argument("--model", type=str, default='bert', help="choose a model: bert")
+parser.add_argument("--model", type=str, default='bert',
+                    help="choose a model: bert")
 args = parser.parse_args()
 
 if __name__ == "__main__":

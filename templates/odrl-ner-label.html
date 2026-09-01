@@ -108,6 +108,19 @@
         <div class="orig-box">{{ question }}</div>
       {% endif %}
 
+      {% if classification %}
+        <div class="section-title">ODRL description classification</div>
+        <div class="orig-box">
+          {{ classification.category|upper }}
+          · confidence {{ '%.2f'|format(classification.confidence * 100) }}%
+          · P(ODRL) {{ '%.2f'|format(classification.probabilities.odrl * 100) }}%
+        </div>
+      {% endif %}
+
+      {% if warning %}
+        <div class="warn">{{ warning }}</div>
+      {% endif %}
+
       {% if result %}
         {% set n_tok = result.text|length %}
         {% set n_lab = result.labels|length %}

@@ -52,7 +52,7 @@ case "$MODEL_PROFILE" in
     modernbert-large)
         MODEL_NAME="modernbert-large-crf"
         DEFAULT_MODEL_PATH="/iridisfs/scratch/mh1f25/llms_model/ModernBERT-large"
-        DEFAULT_BATCH_SIZE=8
+        DEFAULT_BATCH_SIZE=16
         DEFAULT_MAX_LENGTH=400
         DEFAULT_LEARNING_RATE=2e-5
         DEFAULT_LABEL_TYPE=BIO
@@ -62,7 +62,7 @@ case "$MODEL_PROFILE" in
     deberta-v3-large)
         MODEL_NAME="deberta-v3-large-crf"
         DEFAULT_MODEL_PATH="/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large"
-        DEFAULT_BATCH_SIZE=8
+        DEFAULT_BATCH_SIZE=16
         DEFAULT_MAX_LENGTH=400
         DEFAULT_LEARNING_RATE=2e-5
         DEFAULT_LABEL_TYPE=BIO
@@ -72,7 +72,7 @@ case "$MODEL_PROFILE" in
     deberta-v3-large-lstm)
         MODEL_NAME="deberta-v3-large-lstm-crf"
         DEFAULT_MODEL_PATH="/iridisfs/scratch/mh1f25/llms_model/deberta-v3-large"
-        DEFAULT_BATCH_SIZE=8
+        DEFAULT_BATCH_SIZE=16
         DEFAULT_MAX_LENGTH=512
         DEFAULT_LEARNING_RATE=2e-5
         DEFAULT_LABEL_TYPE=BIOES
@@ -224,56 +224,67 @@ echo "Job finished: $(date --iso-8601=seconds)"
 
 
 #  - modernbert-large
-  #  - deberta-v3-large
-  #  - bert — contract BERT + CRF
-  #
-  #  There is now one shared training command. You do not need to comment/uncomment model
-  #  blocks.
-  #
-  #  Run DeBERTa:
-  #
+#  - deberta-v3-large
+#  - bert — contract BERT + CRF
+#
+#  There is now one shared training command. You do not need to comment/uncomment model
+#  blocks.
+#
+#  Run DeBERTa:
+#
 #    sbatch \
 #      --export=ALL,MODEL_PROFILE=deberta-v3-large,NUM_EPOCHS=30,LABEL_TYPE=BIOES \
 #      --job-name=odrl_deberta \
 #      --output=result_out/main_deberta_ltBIOSE_epoch30_-%j.out \
 #      gpu_run_funetuning.sh
-  #
-  #  Run DeBERTa + BiLSTM + CRF:
-  #
+#
+#  Run DeBERTa + BiLSTM + CRF:
+#
 #    sbatch \
 #      --export=ALL,MODEL_PROFILE=deberta-v3-large-lstm,NUM_EPOCHS=30 \
 #      --job-name=odrl_deberta_lstm \
 #      --output=result_out/main_deberta_lstm_ltBIOES_epoch30-%j.out \
 #      gpu_run_funetuning.sh
-  #
-  #  Run ModernBERT:
-  #
+#
+#  Run ModernBERT:
+#
 #    sbatch \
 #      --export=ALL,MODEL_PROFILE=modernbert-large \
 #      --job-name=odrl_modernbert \
 #      --output=result_out/main_modernbert-%j.out \
 #      gpu_run_funetuning.sh
-  #
-  #  Run contract BERT:
-  #
-  #  sbatch \
-  #    --export=ALL,MODEL_PROFILE=bert \
-  #    --job-name=odrl_bert \
-  #    --output=result_out/main_bert-%j.out \
-  #    gpu_run_funetuning.sh
-  #
-  #  Running without a profile uses ModernBERT:
-  #
-  #  sbatch gpu_run_funetuning.sh
-  #
-  #  Each profile sets its own model path, model identifier, batch size, maximum length,
-  #  learning rate, label type, architecture, and AMP precision.
-  #
-  #  You can override individual settings:
-  #
-  #  sbatch \
-  #    --export=ALL,MODEL_PROFILE=deberta-v3-
-  #    large,BATCH_SIZE=16,MAX_LENGTH=512,LEARNING_RATE=1e-5 \
-  #    gpu_run_funetuning.sh
-  #
-  #  The script passes Bash syntax validation.
+#
+#  Run contract BERT:
+#
+#  sbatch \
+#    --export=ALL,MODEL_PROFILE=bert \
+#    --job-name=odrl_bert \
+#    --output=result_out/main_bert-%j.out \
+#    gpu_run_funetuning.sh
+#
+#  Running without a profile uses ModernBERT:
+#
+#  sbatch gpu_run_funetuning.sh
+#
+#  Each profile sets its own model path, model identifier, batch size, maximum length,
+#  learning rate, label type, architecture, and AMP precision.
+#
+#  You can override individual settings:
+#
+#  sbatch \
+#    --export=ALL,MODEL_PROFILE=deberta-v3-
+#    large,BATCH_SIZE=16,MAX_LENGTH=512,LEARNING_RATE=1e-5 \
+#    gpu_run_funetuning.sh
+#
+#  The script passes Bash syntax validation.
+#  running examples:
+#sbatch \
+#    --export=ALL,MODEL_PROFILE=deberta-v3-large-lstm,NUM_EPOCHS=20,LABEL_TYPE=BIOES,HIDDEN_DIM=512,BATCH_SIZE=32,RNN_LAYERS=2,RNN_DROPOUT=0.1 \
+#    --job-name=odrl_deberta_lstm2 \
+#    --output=result_out/main_deberta_lstm2-%j.out \
+#    gpu_run_funetuning.sh
+#
+#
+# sbatch       --export=ALL,MODEL_PROFILE=deberta-v3-large,NUM_EPOCHS=30,LABEL_TYPE=BIOSE       --job-name=odrl_deberta
+#  --output=result_out/main_deberta_ltBIOSE_epoch30_-%j.out       gpu_run_funetuning.sh
+

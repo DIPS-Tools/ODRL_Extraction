@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ODRL Description Classifier</title>
+  <style>
+    :root {
+      --bg:#0f1220; --panel:#161a2b; --ink:#e6e8f0; --muted:#9aa3b2;
+      --accent:#6ea8fe; --border:#2a3150; --odrl:#57cc99; --non:#ff7b7b;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,sans-serif; }
+    main { max-width:850px; margin:40px auto; padding:0 18px; }
+    .card { background:var(--panel); border:1px solid #232848; border-radius:14px; padding:20px; }
+    h1 { margin:0 0 6px; font-size:24px; }
+    .muted { color:var(--muted); }
+    textarea { width:100%; min-height:150px; margin-top:18px; color:var(--ink); background:#0e1230;
+      border:1px solid var(--border); border-radius:12px; padding:13px; resize:vertical; }
+    button { margin-top:10px; background:var(--accent); color:#0a0e1a; border:0; border-radius:10px;
+      padding:10px 16px; font-weight:700; cursor:pointer; }
+    .result { margin-top:20px; padding:16px; border:1px solid var(--border); border-radius:12px; }
+    .category { display:inline-block; padding:5px 12px; border-radius:999px; font-weight:800; }
+    .odrl { background:var(--odrl); color:#002018; }
+    .non { background:var(--non); color:#3b0000; }
+    .meter { height:10px; margin-top:10px; background:#252b46; border-radius:999px; overflow:hidden; }
+    .meter span { display:block; height:100%; background:var(--accent); }
+    code { color:#b9d3ff; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <h1>ODRL Description Classifier</h1>
+      <div class="muted">Determine whether input text describes an ODRL-related rule.</div>
+
+      <form method="post" action="/classifier">
+        <textarea name="text" required placeholder="Enter a policy or ordinary description…">{{ (question or '')|e }}</textarea>
+        <button type="submit">Classify text</button>
+      </form>
+
+      {% if result %}
+        <div class="result">
+          <span class="category {{ result.category }}">{{ result.category|upper }}</span>
+          <p>Confidence: <strong>{{ '%.2f'|format(result.confidence * 100) }}%</strong></p>
+          <p>P(ODRL): {{ '%.2f'|format(result.probabilities.odrl * 100) }}%</p>
+          <div class="meter" aria-label="ODRL probability">
+            <span style="width:{{ result.probabilities.odrl * 100 }}%"></span>
+          </div>
+        </div>
+      {% endif %}
+
+      <p class="muted">JSON API: <code>POST /classify</code> · Documentation: <a href="/docs">/docs</a></p>
+    </div>
+  </main>
+</body>
+</html>
