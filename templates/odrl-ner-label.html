@@ -77,12 +77,12 @@
     </div>
 
     <div class="card">
-      <form method="post" action="/odrl-ner-label">
+      <form id="label-form">
         <div class="row">
           <div class="field">
             <textarea name="text" placeholder="Paste a sentence to tag…">{{ (question or '')|e }}</textarea>
             <div class="actions">
-              <button type="submit">Label sentence</button>
+              <button type="submit" id="label-button">Label sentence</button>
               <span class="help">BIOES tags: ASSIGNEE, ACTION, ASSET, RULE_TYPE, CONSTRAINT, PURPOSE</span>
             </div>
           </div>
@@ -103,57 +103,157 @@
         <span class="tag"><span class="sw" style="background:var(--o)"></span>O</span>
       </div>
 
-      {% if question %}
-        <div class="section-title">Original sentence</div>
-        <div class="orig-box">{{ question }}</div>
-      {% endif %}
+      <section id="original-section" hidden>
+        <div class="section-title">Original text</div>
+        <div class="orig-box" id="original-text"></div>
+      </section>
 
-      {% if classification %}
+      <section id="classification-section" hidden>
         <div class="section-title">ODRL description classification</div>
-        <div class="orig-box">
-          {{ classification.category|upper }}
-          · confidence {{ '%.2f'|format(classification.confidence * 100) }}%
-          · P(ODRL) {{ '%.2f'|format(classification.probabilities.odrl * 100) }}%
-        </div>
-      {% endif %}
+        <div class="orig-box" id="classification-result"></div>
+      </section>
 
-      {% if warning %}
-        <div class="warn">{{ warning }}</div>
-      {% endif %}
+      <div class="warn" id="label-error" role="alert" hidden></div>
 
-      {% if result %}
-        {% set n_tok = result.text|length %}
-        {% set n_lab = result.labels|length %}
-        {% if n_tok != n_lab %}
-          <div class="warn">Length mismatch: {{n_tok}} tokens vs {{n_lab}} labels. Showing min(len(tokens), len(labels)).</div>
-        {% endif %}
-        {% set N = n_tok if n_tok < n_lab else n_lab %}
-
+      <section id="result-section" hidden>
         <div class="section-title">Token-by-token labels</div>
-        <div class="tokens">
-          {% for i in range(N) %}
-            {% set token = result.text[i] %}
-            {% set lab = result.labels[i] %}
-            {% set base = (lab.split('-', 1)[1]) if ('-' in lab) else lab %}
-            {% if base.startswith('RULE_TYPE') %}
-              {% set base = 'RULE_TYPE' %}
-            {% elif base not in [
-              'ASSET','ACTION','ASSIGNEE','CONSTRAINT','DUTY','PURPOSE','PARTY_ASSIGNEE','PARTY_ASSIGNER','CONSEQUENCE','O'
-            ] %}
-              {% set base = 'O' %}
-            {% endif %}
-            <div class="tok">
-              <div class="w">{{ token }}</div>
-              <div class="lab e-{{ base }}">{{ lab }}</div>
-            </div>
-          {% endfor %}
+        <div class="tokens" id="token-results"></div>
+        <div class="actions" style="margin-top:18px">
+          <button type="button" id="download-odrl-json">Download ODRL JSON</button>
+          <span class="help">Includes both row-odrl extraction and standard ODRL JSON-LD.</span>
         </div>
-      {% else %}
-        <p class="muted" style="margin-top:12px">Enter a sentence above and press “Label sentence”.</p>
-      {% endif %}
+        <div class="warn" id="download-error" role="alert" hidden></div>
+      </section>
+
+      <p class="muted" id="empty-result" style="margin-top:12px">Enter text above and press “Label sentence”.</p>
     </div>
 
     <footer>Rendered by FastAPI · tokens are aligned 1:1 with labels</footer>
   </div>
+  <script>
+    const form = document.getElementById('label-form');
+    const labelButton = document.getElementById('label-button');
+    const textArea = document.querySelector('textarea[name="text"]');
+    const labelError = document.getElementById('label-error');
+    const resultSection = document.getElementById('result-section');
+    const tokenResults = document.getElementById('token-results');
+    const originalSection = document.getElementById('original-section');
+    const originalText = document.getElementById('original-text');
+    const classificationSection = document.getElementById('classification-section');
+    const classificationResult = document.getElementById('classification-result');
+    const emptyResult = document.getElementById('empty-result');
+    const downloadButton = document.getElementById('download-odrl-json');
+    const knownLabels = new Set([
+      'ASSET', 'ACTION', 'ASSIGNEE', 'CONSTRAINT', 'DUTY', 'PURPOSE',
+      'PARTY_ASSIGNEE', 'PARTY_ASSIGNER', 'CONSEQUENCE', 'O'
+    ]);
+
+    function labelClass(label) {
+      let base = label.includes('-') ? label.split('-', 2)[1] : label;
+      if (base.startsWith('RULE_TYPE')) return 'RULE_TYPE';
+      return knownLabels.has(base) ? base : 'O';
+    }
+
+    function renderLabels(tokens, labels) {
+      tokenResults.replaceChildren();
+      const count = Math.min(tokens.length, labels.length);
+      for (let index = 0; index < count; index += 1) {
+        const token = document.createElement('div');
+        token.className = 'tok';
+        const word = document.createElement('div');
+        word.className = 'w';
+        word.textContent = tokens[index];
+        const tag = document.createElement('div');
+        tag.className = `lab e-${labelClass(labels[index])}`;
+        tag.textContent = labels[index];
+        token.append(word, tag);
+        tokenResults.appendChild(token);
+      }
+      if (tokens.length !== labels.length) {
+        labelError.textContent = `Length mismatch: ${tokens.length} tokens vs ${labels.length} labels.`;
+        labelError.hidden = false;
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const inputText = textArea.value.trim();
+      if (!inputText) return;
+      labelError.hidden = true;
+      resultSection.hidden = true;
+      classificationSection.hidden = true;
+      labelButton.disabled = true;
+      labelButton.textContent = 'Extracting…';
+      originalText.textContent = inputText;
+      originalSection.hidden = false;
+      emptyResult.hidden = true;
+      try {
+        const response = await fetch('/odrl_generation', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text: inputText})
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || 'ODRL extraction failed.');
+        }
+        if (payload.classification) {
+          const classification = payload.classification;
+          classificationResult.textContent =
+            `${classification.category.toUpperCase()} · confidence ${(classification.confidence * 100).toFixed(2)}%` +
+            ` · P(ODRL) ${(classification.probabilities.odrl * 100).toFixed(2)}%`;
+          classificationSection.hidden = false;
+        }
+        if (payload.warning) {
+          labelError.textContent = payload.warning;
+          labelError.hidden = false;
+        }
+        renderLabels(payload.text || [], payload.labels || []);
+        resultSection.hidden = !(payload.text || []).length;
+      } catch (error) {
+        labelError.textContent = error.message;
+        labelError.hidden = false;
+      } finally {
+        labelButton.disabled = false;
+        labelButton.textContent = 'Label sentence';
+      }
+    });
+
+    downloadButton.addEventListener('click', async () => {
+        const errorBox = document.getElementById('download-error');
+        errorBox.hidden = true;
+        downloadButton.disabled = true;
+        downloadButton.textContent = 'Preparing JSON…';
+        try {
+          const response = await fetch('/odrl_extraction_stds', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({text: textArea.value})
+          });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.detail || 'ODRL serialization failed.');
+          }
+          const blob = new Blob(
+            [JSON.stringify(payload, null, 2)],
+            {type: 'application/json'}
+          );
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = 'ordl-generation.json';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          URL.revokeObjectURL(url);
+        } catch (error) {
+          errorBox.textContent = error.message;
+          errorBox.hidden = false;
+        } finally {
+          downloadButton.disabled = false;
+          downloadButton.textContent = 'Download ODRL JSON';
+        }
+      });
+  </script>
 </body>
 </html>

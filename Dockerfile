@@ -20,6 +20,7 @@ COPY app_rule_bias.py odrl_output.py ./
 COPY model ./model
 COPY src ./src
 COPY templates ./templates
+COPY ontology/ODRL22.rdf ./ontology/ODRL22.rdf
 
 # Config creates these paths during startup. The checkpoint itself is supplied
 # as a read-only bind mount by docker-compose.yml.

@@ -11,7 +11,7 @@ import uvicorn
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app_rule_bias import (
     ODRLGenerationRequest,
@@ -27,6 +27,7 @@ from odrl_classification.app_odrl_classification import (
     ODRLClassifier,
 )
 from odrl_output import format_odrl_rules, split_sentences
+from src.serialization_odrl import ODRLSerializationError, build_odrl_export
 
 
 ORDINARY_TEXT_WARNING = (
@@ -40,6 +41,8 @@ class DetectedODRLGenerationResponse(BaseModel):
     classification: ClassificationResponse
     warning: Optional[str]
     rules: List[ODRLRule]
+    text: List[str] = Field(default_factory=list)
+    labels: List[str] = Field(default_factory=list)
 
 
 app = FastAPI(
@@ -78,16 +81,22 @@ def _classify(text: str) -> dict:
 
 
 def _accepted_as_odrl(classification: dict) -> bool:
+    print(f"classification probabilities : {classification}")
+
     return float(classification["probabilities"]["odrl"]) >= odrl_threshold
 
 
-def _extract(text: str) -> List[dict]:
+def _extract(text: str) -> dict:
     _ensure_models_ready()
     assert extraction_model is not None and extraction_config is not None
     rules: List[dict] = []
+    tokens: List[str] = []
+    labels: List[str] = []
     with _extraction_lock:
         for sentence in split_sentences(text):
             prediction = query_test(extraction_model, extraction_config, sentence)
+            tokens.extend(prediction["text"])
+            labels.extend(prediction["labels"])
             rules.extend(
                 format_odrl_rules(
                     sentence,
@@ -95,7 +104,7 @@ def _extract(text: str) -> List[dict]:
                     prediction["labels"],
                 )
             )
-    return rules
+    return {"rules": rules, "text": tokens, "labels": labels}
 
 
 @app.get("/")
@@ -151,30 +160,6 @@ def odrl_ner_label_page(request: Request):
     )
 
 
-@app.post("/")
-@app.post("/odrl-ner-label")
-def predict(request: Request, text: str = Form(...)):
-    classification = _classify(text)
-    accepted = _accepted_as_odrl(classification)
-    result = None
-    # The GUI displays token labels, so invoke the extractor once for the full
-    # submitted text only when the classification gate accepts it.
-    if accepted:
-        assert extraction_model is not None and extraction_config is not None
-        with _extraction_lock:
-            result = query_test(extraction_model, extraction_config, text)
-    return templates.TemplateResponse(
-        request=request,
-        name="odrl-ner-label.html",
-        context={
-            "question": text,
-            "result": result,
-            "classification": classification,
-            "warning": None if accepted else ORDINARY_TEXT_WARNING,
-        },
-    )
-
-
 @app.get("/visulize-records")
 def visulize_records(request: Request):
     return templates.TemplateResponse(
@@ -204,14 +189,29 @@ def odrl_generation(payload: ODRLGenerationRequest):
             "classification": classification,
             "warning": ORDINARY_TEXT_WARNING,
             "rules": [],
+            "text": [],
+            "labels": [],
         }
 
+    extraction = _extract(payload.text)
     return {
         "is_odrl": True,
         "classification": classification,
         "warning": None,
-        "rules": _extract(payload.text),
+        **extraction,
     }
+
+
+@app.post("/odrl_extraction_stds")
+def odrl_extraction_stds(payload: ODRLGenerationRequest):
+    """Classify, extract, and return raw plus standard ODRL representations."""
+    classification = _classify(payload.text)
+    if not _accepted_as_odrl(classification):
+        raise HTTPException(status_code=422, detail=ORDINARY_TEXT_WARNING)
+    try:
+        return build_odrl_export(_extract(payload.text)["rules"])
+    except ODRLSerializationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def build_parser():

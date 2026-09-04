@@ -134,6 +134,8 @@ class ODRLClassifier:
             LABELS[index]: float(probabilities[index].item())
             for index in sorted(LABELS)
         }
+        print(f"ODRL Classifier :{probability_map}")
+
         return {
             "uid": uid,
             "text": source_text,

@@ -4,16 +4,17 @@ import os
 import argparse
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import uvicorn
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from src.hybrid_extraction_rules import decode_with_rule_bias, postprocess_tags
+from src.serialization_odrl import ODRLSerializationError, build_odrl_export
 from model.config import Config
 from odrl_output import format_odrl_rules, split_sentences
 from src.utils import _words_from_text
@@ -44,6 +45,8 @@ class ODRLRule(BaseModel):
 
 class ODRLGenerationResponse(BaseModel):
     rules: List[ODRLRule]
+    text: List[str] = Field(default_factory=list)
+    labels: List[str] = Field(default_factory=list)
 
 
 def _clean_output_token(token: str) -> str:
@@ -341,23 +344,6 @@ def odrl_ner_label_page(request: Request):
     )
 
 
-@app.post('/')
-@app.post('/odrl-ner-label')
-def predict(request: Request, text: str = Form(...)):
-    if config is None or model is None:
-        raise RuntimeError(
-            "The inference model is not initialized. Start the service with "
-            "`python app_rule_bias.py` and the required model arguments."
-        )
-
-    result = query_test(model, config, text)
-    return templates.TemplateResponse(
-        request=request,
-        name='odrl-ner-label.html',
-        context={'question': text, 'result': result},
-    )
-
-
 @app.get('/visulize-records')
 def visulize_records(request: Request):
     return templates.TemplateResponse(
@@ -394,15 +380,40 @@ def odrl_generation(payload: ODRLGenerationRequest):
             ),
         )
 
-    rules = []
-    for sentence in split_sentences(payload.text):
+    return _generate_extraction(payload.text)
+
+
+def _generate_extraction(text: str) -> Dict[str, Any]:
+    """Extract sentence-level rules and concatenate their aligned NER output."""
+    rules: List[Dict[str, str]] = []
+    tokens: List[str] = []
+    labels: List[str] = []
+    for sentence in split_sentences(text):
         result = query_test(model, config, sentence)
+        tokens.extend(result["text"])
+        labels.extend(result["labels"])
         rules.extend(format_odrl_rules(
             sentence,
             result["text"],
             result["labels"],
         ))
-    return {"rules": rules}
+    return {"rules": rules, "text": tokens, "labels": labels}
+
+
+def _generate_rules(text: str) -> List[Dict[str, str]]:
+    """Extract all sentence-level rules from one input document."""
+    return _generate_extraction(text)["rules"]
+
+
+@app.post('/odrl_extraction_stds', response_model=Dict[str, Any])
+def odrl_extraction_stds(payload: ODRLGenerationRequest):
+    """Return raw extraction and standards-oriented ODRL JSON-LD."""
+    if config is None or model is None:
+        raise HTTPException(status_code=503, detail="The extraction model is not initialized.")
+    try:
+        return build_odrl_export(_generate_rules(payload.text))
+    except ODRLSerializationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 if __name__ == '__main__':
